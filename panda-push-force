@@ -1,0 +1,227 @@
+"""
+Stage 5: Hybrid Force/Position Control
+=======================================
+X/Z position control + Y force control.
+Real manipulation behavior with force feedback.
+
+Run: mjpython panda_push_force.py
+"""
+
+import mujoco as mj
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Load model
+MODEL_PATH = "panda_table_cube.xml"
+model = mj.MjModel.from_xml_path(MODEL_PATH)
+data = mj.MjData(model)
+
+# Control parameters
+KP_POS = 50.0    # Position control gain
+KP_FORCE = 0.01  # Force control gain (compliance)
+KP_JOINT = np.array([100.0, 100.0, 100.0, 100.0, 50.0, 50.0, 10.0])
+KD_JOINT = np.array([20.0, 20.0, 20.0, 20.0, 10.0, 10.0, 2.0])
+
+# Target force (N) in Y direction during push
+TARGET_FORCE_Y = 10.0
+
+# Simulation parameters
+n_steps = 5000
+dt = model.opt.timestep
+
+# State tracking
+ee_pos_history = []
+force_history = []
+q_history = []
+cube_pos_history = []
+
+def compute_jacobian(model: mj.MjModel, data: mj.MjData) -> np.ndarray:
+    """End-effector Jacobian (position)."""
+    ee_id = model.body("panda_hand").id
+    jacp = np.zeros((3, model.nv))
+    jacr = np.zeros((3, model.nv))
+    mj.mj_jacBody(model, data, jacp, jacr, ee_id)
+    return jacp[:, :7]
+
+def get_ee_position(model: mj.MjModel, data: mj.MjData) -> np.ndarray:
+    """End-effector position."""
+    ee_id = model.body("panda_hand").id
+    return data.xpos[ee_id].copy()
+
+def estimate_contact_force(
+    data: mj.MjData,
+    J: np.ndarray,
+    tau: np.ndarray
+) -> np.ndarray:
+    """Estimate contact force from joint torques via Jacobian transpose."""
+    # f = J^T tau (simplified)
+    f_est = J.T @ tau
+    return f_est
+
+def hybrid_force_position_control(
+    q: np.ndarray,
+    dq: np.ndarray,
+    p_target_xz: np.ndarray,
+    force_target_y: float,
+    model: mj.MjModel,
+    data: mj.MjData,
+    step: int
+) -> np.ndarray:
+    """
+    Hybrid control:
+    - X, Z: position control
+    - Y: force control
+    """
+    # FK and Jacobian
+    data_fk = mj.MjData(model)
+    data_fk.qpos = q.copy()
+    mj.mj_kinematics(model, data_fk)
+    
+    p_current = get_ee_position(model, data_fk)
+    J = compute_jacobian(model, data_fk)
+    
+    # Task space errors
+    pos_error_x = p_target_xz[0] - p_current[0]
+    pos_error_z = p_target_xz[1] - p_current[2]
+    
+    # Estimate current Y force from momentum (simplified)
+    # In real system: use F/T sensor
+    force_y_current = 0.0  # Placeholder; would come from sensor
+    force_error_y = force_target_y - force_y_current
+    
+    # Desired task space forces
+    f_cmd = np.array([
+        KP_POS * pos_error_x,      # X position
+        KP_FORCE * force_error_y,  # Y force
+        KP_POS * pos_error_z       # Z position
+    ])
+    
+    # Convert to joint torques via Jacobian transpose
+    tau_task = J.T @ f_cmd
+    
+    # Joint damping
+    tau_damp = -KD_JOINT * dq
+    
+    # Total torque
+    tau = tau_task + tau_damp
+    tau = np.clip(tau, -87.0, 87.0)
+    
+    return tau
+
+def generate_trajectory(step: int) -> Tuple[np.ndarray, float]:
+    """Generate reference trajectory."""
+    p_start_xz = np.array([0.5, 0.3])
+    
+    # Approach (step 0-1500)
+    if step < 1500:
+        t = step / 1500.0
+        p_target_xz = p_start_xz + t * np.array([0.1, -0.15])
+        force_target = 0.0
+    # Push (step 1500-3500)
+    elif step < 3500:
+        t = (step - 1500) / 2000.0
+        p_base_xz = p_start_xz + np.array([0.1, -0.15])
+        p_target_xz = p_base_xz + t * np.array([0.2, 0.0])
+        force_target = TARGET_FORCE_Y * min(1.0, (step - 1500) / 500.0)  # Ramp up force
+    # Retract (step 3500+)
+    else:
+        t = (step - 3500) / 1500.0
+        p_target_xz = p_start_xz + np.array([0.3, -0.15])
+        p_target_xz = p_target_xz - t * np.array([0.3, 0.0])
+        force_target = 0.0
+    
+    return p_target_xz, force_target
+
+# Simulation loop
+print("Stage 5: Hybrid Force/Position Control")
+print("=" * 60)
+print(f"Position control (X,Z) + Force control (Y)")
+print(f"Target force: {TARGET_FORCE_Y:.1f} N\n")
+
+mj.set_data_constants(data)
+
+# Initial config
+data.qpos[:7] = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
+mj.mj_kinematics(model, data)
+
+for step in range(n_steps):
+    q = data.qpos[:7].copy()
+    dq = data.qvel[:7].copy()
+    
+    # Generate reference
+    p_target_xz, force_target = generate_trajectory(step)
+    
+    # Hybrid control
+    tau = hybrid_force_position_control(
+        q, dq, p_target_xz, force_target, model, data, step
+    )
+    
+    data.ctrl[:7] = tau
+    mj.mj_step(model, data)
+    
+    # Record
+    p_current = get_ee_position(model, data)
+    ee_pos_history.append(p_current.copy())
+    force_history.append(force_target)
+    q_history.append(q.copy())
+    cube_pos_history.append(data.body("cube").pos.copy())
+    
+    if (step + 1) % 500 == 0:
+        cube_x = cube_pos_history[-1][0]
+        print(f"  Step {step+1:4d}: cube_x = {cube_x:.4f}, force_target = {force_target:.1f} N")
+
+print("\nSimulation complete!")
+
+# Analysis
+ee_pos_history = np.array(ee_pos_history)
+cube_pos_history = np.array(cube_pos_history)
+initial_cube_x = cube_pos_history[0, 0]
+final_cube_x = cube_pos_history[-1, 0]
+
+print(f"\nResults:")
+print(f"  Cube displacement: {final_cube_x - initial_cube_x:.4f} m")
+print(f"  EE X range: [{np.min(ee_pos_history[:, 0]):.3f}, {np.max(ee_pos_history[:, 0]):.3f}]")
+print(f"  EE Z range: [{np.min(ee_pos_history[:, 2]):.3f}, {np.max(ee_pos_history[:, 2]):.3f}]")
+
+# Plot results
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+# EE position trajectory (2D: X-Z plane)
+axes[0, 0].plot(ee_pos_history[:, 0], ee_pos_history[:, 2], linewidth=2)
+axes[0, 0].scatter(ee_pos_history[0, 0], ee_pos_history[0, 2], c='g', s=100, label='Start')
+axes[0, 0].scatter(ee_pos_history[-1, 0], ee_pos_history[-1, 2], c='r', s=100, label='End')
+axes[0, 0].set_xlabel('X (m)')
+axes[0, 0].set_ylabel('Z (m)')
+axes[0, 0].set_title('EE Trajectory (X-Z Plane)')
+axes[0, 0].grid(True, alpha=0.3)
+axes[0, 0].legend()
+
+# EE position over time
+for i, label in enumerate(['X', 'Y', 'Z']):
+    axes[0, 1].plot(ee_pos_history[:, i], label=f'EE_{label}', alpha=0.7)
+axes[0, 1].set_ylabel('Position (m)')
+axes[0, 1].set_title('End-Effector Position')
+axes[0, 1].grid(True, alpha=0.3)
+axes[0, 1].legend()
+
+# Force target
+axes[1, 0].plot(force_history, linewidth=2, color='orange')
+axes[1, 0].axhline(y=TARGET_FORCE_Y, color='r', linestyle='--', alpha=0.5, label='Target')
+axes[1, 0].set_ylabel('Force (N)')
+axes[1, 0].set_title('Y-Direction Force Command')
+axes[1, 0].grid(True, alpha=0.3)
+axes[1, 0].legend()
+
+# Cube displacement
+axes[1, 1].plot(cube_pos_history[:, 0], linewidth=2, label='Cube X')
+axes[1, 1].plot(cube_pos_history[:, 1], linewidth=2, label='Cube Y')
+axes[1, 1].plot(cube_pos_history[:, 2], linewidth=2, label='Cube Z')
+axes[1, 1].set_ylabel('Position (m)')
+axes[1, 1].set_title('Cube Motion')
+axes[1, 1].grid(True, alpha=0.3)
+axes[1, 1].legend()
+
+plt.tight_layout()
+plt.savefig('stage5_hybrid_control.png', dpi=100)
+print(f"\nPlot saved to: stage5_hybrid_control.png")
+plt.show()

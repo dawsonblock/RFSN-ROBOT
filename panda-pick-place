@@ -1,0 +1,219 @@
+"""
+Stage 6: Full Pick and Place
+=============================
+6-state cycle: descend, close, lift, place, open, home.
+Gripper auto-detection. Complete manipulation primitive.
+
+Run: mjpython panda_pick_place.py
+"""
+
+import mujoco as mj
+import numpy as np
+import matplotlib.pyplot as plt
+from enum import Enum
+
+# Load model
+MODEL_PATH = "panda_table_cube.xml"
+model = mj.MjModel.from_xml_path(MODEL_PATH)
+data = mj.MjData(model)
+
+# State machine for pick/place
+class PickPlaceState(Enum):
+    HOME = 0
+    DESCEND = 1
+    CLOSE = 2
+    LIFT = 3
+    PLACE = 4
+    OPEN = 5
+
+# Control parameters
+KP = np.array([100.0, 100.0, 100.0, 100.0, 50.0, 50.0, 10.0])
+KD = np.array([20.0, 20.0, 20.0, 20.0, 10.0, 10.0, 2.0])
+
+# Gripper parameters
+GRIPPER_CLOSE_CMD = 0.035  # Closed position
+GRIPPER_OPEN_CMD = 0.0      # Open position
+
+# Task waypoints
+q_home = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
+q_descend = np.array([0.0, -1.2, 0.0, -1.2, 0.0, 1.571, 0.785])  # Above cube
+q_lift = np.array([0.0, -0.8, 0.0, -2.356, 0.0, 1.571, 0.785])   # Lifted
+q_place = np.array([0.3, -0.8, 0.0, -2.356, 0.0, 1.571, 0.785])  # Place location
+
+# Simulation parameters
+n_steps = 6000
+dt = model.opt.timestep
+
+# State machine tracking
+state_history = []
+q_history = []
+gripper_history = []
+cube_pos_history = []
+contact_history = []
+
+def detect_contact_simple(data: mj.MjData) -> bool:
+    """Detect gripper-cube contact (simplified)."""
+    # Check if cube is being held (simplified)
+    cube_pos = data.body("cube").pos[2]
+    return cube_pos > 0.5  # If cube high enough, likely grasped
+
+def get_gripper_command(state: PickPlaceState) -> float:
+    """Get gripper position command."""
+    if state == PickPlaceState.CLOSE:
+        return GRIPPER_CLOSE_CMD
+    elif state == PickPlaceState.OPEN:
+        return GRIPPER_OPEN_CMD
+    else:
+        return GRIPPER_OPEN_CMD
+
+def state_machine_step(
+    current_state: PickPlaceState,
+    step: int,
+    contact_detected: bool
+) -> PickPlaceState:
+    """Deterministic state transitions."""
+    state_timings = {
+        PickPlaceState.HOME: (0, 1000),
+        PickPlaceState.DESCEND: (1000, 2000),
+        PickPlaceState.CLOSE: (2000, 2500),
+        PickPlaceState.LIFT: (2500, 3500),
+        PickPlaceState.PLACE: (3500, 4500),
+        PickPlaceState.OPEN: (4500, 5000),
+    }
+    
+    start, end = state_timings[current_state]
+    if step >= end:
+        # Transition to next state
+        next_states = {
+            PickPlaceState.HOME: PickPlaceState.DESCEND,
+            PickPlaceState.DESCEND: PickPlaceState.CLOSE,
+            PickPlaceState.CLOSE: PickPlaceState.LIFT,
+            PickPlaceState.LIFT: PickPlaceState.PLACE,
+            PickPlaceState.PLACE: PickPlaceState.OPEN,
+            PickPlaceState.OPEN: PickPlaceState.HOME,
+        }
+        return next_states[current_state]
+    
+    return current_state
+
+def get_target_configuration(state: PickPlaceState) -> np.ndarray:
+    """Get joint target for current state."""
+    targets = {
+        PickPlaceState.HOME: q_home,
+        PickPlaceState.DESCEND: q_descend,
+        PickPlaceState.CLOSE: q_descend,
+        PickPlaceState.LIFT: q_lift,
+        PickPlaceState.PLACE: q_place,
+        PickPlaceState.OPEN: q_place,
+    }
+    return targets[state]
+
+def pd_control(q: np.ndarray, dq: np.ndarray, q_target: np.ndarray) -> np.ndarray:
+    """Joint PD control."""
+    error = q_target - q
+    tau = KP * error - KD * dq
+    tau = np.clip(tau, -87.0, 87.0)
+    return tau
+
+# Simulation loop
+print("Stage 6: Full Pick and Place Cycle")
+print("=" * 60)
+print("HOME â†’ DESCEND â†’ CLOSE â†’ LIFT â†’ PLACE â†’ OPEN â†’ HOME")
+print(f"Total time: {n_steps * dt:.2f}s\n")
+
+mj.set_data_constants(data)
+
+# Initialize state
+current_state = PickPlaceState.HOME
+data.qpos[:7] = q_home
+mj.mj_kinematics(model, data)
+
+for step in range(n_steps):
+    # Get current state
+    q = data.qpos[:7].copy()
+    dq = data.qvel[:7].copy()
+    
+    # State machine
+    current_state = state_machine_step(current_state, step, False)
+    q_target = get_target_configuration(current_state)
+    
+    # Joint control
+    tau = pd_control(q, dq, q_target)
+    data.ctrl[:7] = tau
+    
+    # Gripper control
+    gripper_cmd = get_gripper_command(current_state)
+    data.ctrl[7] = gripper_cmd * 100  # Convert to motor command
+    data.ctrl[8] = gripper_cmd * 100
+    
+    # Step simulation
+    mj.mj_step(model, data)
+    
+    # Record
+    contact = detect_contact_simple(data)
+    cube_pos = data.body("cube").pos.copy()
+    
+    state_history.append(current_state)
+    q_history.append(q.copy())
+    gripper_history.append(gripper_cmd)
+    cube_pos_history.append(cube_pos.copy())
+    contact_history.append(contact)
+    
+    if (step + 1) % 500 == 0:
+        error = np.linalg.norm(q_target - q)
+        cube_z = cube_pos[2]
+        print(f"  Step {step+1:4d} [{current_state.name:8s}]: error = {error:.4f}, cube_z = {cube_z:.3f}")
+
+print("\nSimulation complete!")
+
+# Analysis
+state_values = [s.value for s in state_history]
+q_history = np.array(q_history)
+cube_pos_history = np.array(cube_pos_history)
+
+print(f"\nResults:")
+print(f"  Initial cube Z: {cube_pos_history[0, 2]:.4f} m")
+print(f"  Max cube Z: {np.max(cube_pos_history[:, 2]):.4f} m")
+print(f"  Final cube Z: {cube_pos_history[-1, 2]:.4f} m")
+print(f"  Gripper usage: {np.mean(gripper_history):.4f}")
+
+# Plot results
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+# State timeline
+axes[0, 0].fill_between(range(len(state_values)), state_values, alpha=0.5)
+axes[0, 0].set_yticks(range(6))
+axes[0, 0].set_yticklabels([s.name for s in PickPlaceState])
+axes[0, 0].set_ylabel('State')
+axes[0, 0].set_title('State Machine Timeline')
+axes[0, 0].grid(True, alpha=0.3)
+
+# Joint trajectories
+for i in range(7):
+    axes[0, 1].plot(q_history[:, i], alpha=0.7, linewidth=1)
+axes[0, 1].set_ylabel('Position (rad)')
+axes[0, 1].set_title('Joint Trajectories')
+axes[0, 1].grid(True, alpha=0.3)
+
+# Cube position (Z - height)
+axes[1, 0].plot(cube_pos_history[:, 2], linewidth=2, color='green', label='Z (height)')
+axes[1, 0].plot(cube_pos_history[:, 0], linewidth=2, color='blue', alpha=0.7, label='X')
+axes[1, 0].plot(cube_pos_history[:, 1], linewidth=2, color='orange', alpha=0.7, label='Y')
+axes[1, 0].set_ylabel('Position (m)')
+axes[1, 0].set_title('Cube Position During Pick/Place')
+axes[1, 0].grid(True, alpha=0.3)
+axes[1, 0].legend()
+
+# Gripper command
+axes[1, 1].plot(gripper_history, linewidth=2, color='purple')
+axes[1, 1].axhline(y=GRIPPER_CLOSE_CMD, color='r', linestyle='--', alpha=0.5, label='Closed')
+axes[1, 1].axhline(y=GRIPPER_OPEN_CMD, color='g', linestyle='--', alpha=0.5, label='Open')
+axes[1, 1].set_ylabel('Position (m)')
+axes[1, 1].set_title('Gripper Command')
+axes[1, 1].grid(True, alpha=0.3)
+axes[1, 1].legend()
+
+plt.tight_layout()
+plt.savefig('stage6_pick_place.png', dpi=100)
+print(f"\nPlot saved to: stage6_pick_place.png")
+plt.show()

@@ -1,0 +1,162 @@
+"""
+Stage 3: Push Cube with Joint Waypoints
+=========================================
+Contact-aware task: Move to pre-push position, then push cube.
+Impedance control softens during contact.
+
+Run: mjpython panda_push_cube.py
+"""
+
+import mujoco as mj
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Tuple
+
+# Load model
+MODEL_PATH = "panda_table_cube.xml"
+model = mj.MjModel.from_xml_path(MODEL_PATH)
+data = mj.MjData(model)
+
+# Control parameters
+KP = np.array([100.0, 100.0, 100.0, 100.0, 50.0, 50.0, 10.0])
+KD = np.array([20.0, 20.0, 20.0, 20.0, 10.0, 10.0, 2.0])
+
+# Task waypoints
+q_home = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
+q_pre_push = np.array([0.0, -1.2, 0.0, -1.571, 0.0, 1.571, 0.785])  # Above cube
+q_push = np.array([0.1, -1.2, 0.0, -1.571, 0.0, 1.571, 0.785])      # Into cube
+
+# Simulation parameters
+n_steps = 5000
+dt = model.opt.timestep
+
+# State tracking
+q_history = []
+cube_pos_history = []
+contact_force_history = []
+phase_history = []
+
+def detect_contact(data: mj.MjData) -> bool:
+    """Detect if end-effector has contact with cube."""
+    # Check contact forces
+    total_force = np.linalg.norm(data.sensordata[:3]) if len(data.sensordata) > 0 else 0.0
+    return total_force > 1.0
+
+def softened_pd_control(
+    q: np.ndarray,
+    dq: np.ndarray,
+    q_target: np.ndarray,
+    in_contact: bool
+) -> np.ndarray:
+    """PD control with softened impedance during contact."""
+    error = q_target - q
+    
+    if in_contact:
+        # Reduce stiffness to avoid sudden jerks
+        kp_modified = KP * 0.5
+        kd_modified = KD * 0.7
+    else:
+        kp_modified = KP
+        kd_modified = KD
+    
+    tau = kp_modified * error - kd_modified * dq
+    tau = np.clip(tau, -87.0, 87.0)
+    return tau
+
+# Simulation loop
+print("Stage 3: Push Cube Contact Task")
+print("=" * 60)
+print(f"Home â†’ Pre-push â†’ Push")
+print(f"Total time: {n_steps * dt:.2f}s\n")
+
+mj.set_data_constants(data)
+
+# Phase timeline
+phase_steps = [0, 1500, 3000, 5000]
+phases = ["HOME", "PRE_PUSH", "PUSH", "RESET"]
+q_targets = [q_home, q_pre_push, q_push, q_home]
+phase_idx = 0
+
+for step in range(n_steps):
+    # Phase management
+    if step >= phase_steps[min(phase_idx + 1, len(phases) - 1)]:
+        phase_idx = min(phase_idx + 1, len(phases) - 1)
+    
+    q_target = q_targets[phase_idx]
+    phase = phases[phase_idx]
+    
+    # Get state
+    q = data.qpos[:7].copy()
+    dq = data.qvel[:7].copy()
+    
+    # Contact detection
+    in_contact = detect_contact(data)
+    
+    # Softened control
+    tau = softened_pd_control(q, dq, q_target, in_contact)
+    
+    # Apply control
+    data.ctrl[:7] = tau
+    mj.mj_step(model, data)
+    
+    # Get cube position
+    cube_pos = data.body("cube").pos.copy()
+    
+    # Record
+    q_history.append(q.copy())
+    cube_pos_history.append(cube_pos.copy())
+    phase_history.append(phase)
+    
+    if (step + 1) % 500 == 0:
+        error = np.linalg.norm(q_target - q)
+        print(f"  Step {step+1:4d} [{phase}]: error = {error:.4f}, cube_x = {cube_pos[0]:.3f}")
+
+print("\nSimulation complete!")
+
+# Analysis
+q_history = np.array(q_history)
+cube_pos_history = np.array(cube_pos_history)
+initial_cube_x = cube_pos_history[0, 0]
+final_cube_x = cube_pos_history[-1, 0]
+cube_displacement = final_cube_x - initial_cube_x
+
+print(f"\nResults:")
+print(f"  Cube displacement: {cube_displacement:.4f} m")
+print(f"  Initial position: {initial_cube_x:.4f}")
+print(f"  Final position: {final_cube_x:.4f}")
+
+# Plot results
+fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+
+# Joint trajectories
+for i in range(7):
+    axes[0].plot(q_history[:, i], alpha=0.7, label=f'q_{i}')
+axes[0].set_ylabel('Position (rad)')
+axes[0].set_title('Joint Trajectories (7-DOF Arm)')
+axes[0].grid(True, alpha=0.3)
+axes[0].legend(ncol=4, fontsize=8)
+
+# Cube motion
+axes[1].plot(cube_pos_history[:, 0], linewidth=2, label='Cube X')
+axes[1].plot(cube_pos_history[:, 1], linewidth=2, label='Cube Y')
+axes[1].plot(cube_pos_history[:, 2], linewidth=2, label='Cube Z')
+axes[1].set_ylabel('Position (m)')
+axes[1].set_title('Cube Position Over Time')
+axes[1].grid(True, alpha=0.3)
+axes[1].legend()
+
+# Task phases
+phase_map = {"HOME": 0, "PRE_PUSH": 1, "PUSH": 2, "RESET": 3}
+phase_values = [phase_map[p] for p in phase_history]
+axes[2].fill_between(range(len(phase_values)), phase_values, alpha=0.5)
+axes[2].set_yticks([0, 1, 2, 3])
+axes[2].set_yticklabels(["HOME", "PRE_PUSH", "PUSH", "RESET"])
+axes[2].set_ylabel('Phase')
+axes[2].set_xlabel('Step')
+axes[2].set_title('Task Phases')
+axes[2].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('stage3_push_cube.png', dpi=100)
+print(f"\nPlot saved to: stage3_push_cube.png")
+plt.show()

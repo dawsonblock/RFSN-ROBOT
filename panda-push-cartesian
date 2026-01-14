@@ -1,0 +1,219 @@
+"""
+Stage 4: Cartesian Push with Jacobian IK
+=========================================
+End-effector Cartesian trajectory planning.
+Damped least-squares inverse kinematics.
+
+Run: mjpython panda_push_cartesian.py
+"""
+
+import mujoco as mj
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.linalg import pinv
+
+# Load model
+MODEL_PATH = "panda_table_cube.xml"
+model = mj.MjModel.from_xml_path(MODEL_PATH)
+data = mj.MjData(model)
+
+# IK parameters
+DAMPING = 0.1
+IK_ITERATIONS = 10
+KP = 50.0
+
+# Simulation parameters
+n_steps = 5000
+dt = model.opt.timestep
+
+# State tracking
+ee_pos_history = []
+ee_vel_history = []
+q_history = []
+cube_pos_history = []
+
+def compute_jacobian(model: mj.MjModel, data: mj.MjData) -> np.ndarray:
+    """Compute end-effector Jacobian (position only)."""
+    # Get end-effector body ID
+    ee_id = model.body("panda_hand").id
+    
+    # Allocate Jacobian
+    jacp = np.zeros((3, model.nv))
+    jacr = np.zeros((3, model.nv))
+    
+    # Compute full Jacobian
+    mj.mj_jacBody(model, data, jacp, jacr, ee_id)
+    
+    return jacp[:, :7]  # Return position part, 7 DOFs only
+
+def forward_kinematics(model: mj.MjModel, data: mj.MjData) -> np.ndarray:
+    """Get end-effector position."""
+    ee_id = model.body("panda_hand").id
+    return data.xpos[ee_id].copy()
+
+def damped_least_squares_ik(
+    q: np.ndarray,
+    p_target: np.ndarray,
+    model: mj.MjModel,
+    data_template: mj.MjData,
+    damping: float = 0.1
+) -> np.ndarray:
+    """
+    Compute joint velocities using damped least-squares IK.
+    
+    dq = J^T (J J^T + lambda^2 I)^-1 (p_target - p_current)
+    """
+    # Forward kinematics
+    data_fk = mj.MjData(model)
+    data_fk.qpos = q.copy()
+    mj.mj_kinematics(model, data_fk)
+    p_current = forward_kinematics(model, data_fk)
+    
+    # Jacobian
+    J = compute_jacobian(model, data_fk)
+    
+    # Damped least-squares pseudoinverse
+    JJt = J @ J.T
+    I3 = np.eye(3)
+    JJt_reg = JJt + (damping ** 2) * I3
+    Jpinv = J.T @ np.linalg.inv(JJt_reg)
+    
+    # Velocity command
+    error = p_target - p_current
+    dq = Jpinv @ error
+    
+    return dq
+
+def pd_control_with_ik(
+    q: np.ndarray,
+    dq: np.ndarray,
+    dq_cmd: np.ndarray
+) -> np.ndarray:
+    """PD tracking of IK joint velocities."""
+    error_vel = dq_cmd - dq
+    tau = KP * error_vel
+    tau = np.clip(tau, -87.0, 87.0)
+    return tau
+
+# Generate Cartesian trajectory
+def generate_cartesian_trajectory(step: int, n_steps: int) -> np.ndarray:
+    """Generate approach + push trajectory."""
+    # Initial EE position (nominal)
+    p_start = np.array([0.5, 0.0, 0.5])
+    
+    # Approach (step 0-2000)
+    if step < 2000:
+        t = step / 2000.0
+        p_target = p_start + t * np.array([0.1, 0.0, -0.15])
+    # Push (step 2000-4000)
+    elif step < 4000:
+        t = (step - 2000) / 2000.0
+        p_base = p_start + np.array([0.1, 0.0, -0.15])
+        p_target = p_base + t * np.array([0.15, 0.0, 0.0])
+    # Return (step 4000+)
+    else:
+        t = (step - 4000) / 1000.0
+        p_target = p_start + np.array([0.25, 0.0, -0.15])
+        p_target = p_target - (t * 0.25) * np.array([1.0, 0.0, 0.0])
+    
+    return p_target
+
+# Simulation loop
+print("Stage 4: Cartesian Push with Jacobian IK")
+print("=" * 60)
+print(f"Approach â†’ Push â†’ Return")
+print(f"Total time: {n_steps * dt:.2f}s\n")
+
+mj.set_data_constants(data)
+
+# Initial configuration
+data.qpos[:7] = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
+mj.mj_kinematics(model, data)
+
+for step in range(n_steps):
+    # Get state
+    q = data.qpos[:7].copy()
+    dq = data.qvel[:7].copy()
+    
+    # Generate target EE position
+    p_target = generate_cartesian_trajectory(step, n_steps)
+    
+    # IK computation
+    dq_cmd = damped_least_squares_ik(q, p_target, model, data, DAMPING)
+    
+    # PD control
+    tau = pd_control_with_ik(q, dq, dq_cmd)
+    
+    # Apply control
+    data.ctrl[:7] = tau
+    mj.mj_step(model, data)
+    
+    # Record
+    ee_pos = forward_kinematics(model, data)
+    ee_vel = dq[:3].copy()  # Approximate
+    cube_pos = data.body("cube").pos.copy()
+    
+    ee_pos_history.append(ee_pos.copy())
+    ee_vel_history.append(ee_vel.copy())
+    q_history.append(q.copy())
+    cube_pos_history.append(cube_pos.copy())
+    
+    if (step + 1) % 500 == 0:
+        ee_error = np.linalg.norm(p_target - ee_pos)
+        cube_x = cube_pos[0]
+        print(f"  Step {step+1:4d}: EE_error = {ee_error:.4f} m, cube_x = {cube_x:.4f}")
+
+print("\nSimulation complete!")
+
+# Analysis
+ee_pos_history = np.array(ee_pos_history)
+cube_pos_history = np.array(cube_pos_history)
+initial_cube_x = cube_pos_history[0, 0]
+final_cube_x = cube_pos_history[-1, 0]
+
+print(f"\nResults:")
+print(f"  Cube displacement: {final_cube_x - initial_cube_x:.4f} m")
+
+# Plot results
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+# End-effector trajectory (3D)
+ax = plt.subplot(2, 2, 1, projection='3d')
+ax.plot(ee_pos_history[:, 0], ee_pos_history[:, 1], ee_pos_history[:, 2], 
+        linewidth=2, label='EE trajectory')
+ax.scatter(*ee_pos_history[0], color='g', s=100, label='Start')
+ax.scatter(*ee_pos_history[-1], color='r', s=100, label='End')
+ax.set_xlabel('X (m)')
+ax.set_ylabel('Y (m)')
+ax.set_zlabel('Z (m)')
+ax.set_title('End-Effector Cartesian Trajectory')
+ax.legend()
+
+# EE position over time
+for i, label in enumerate(['X', 'Y', 'Z']):
+    axes[0, 1].plot(ee_pos_history[:, i], label=f'EE_{label}', alpha=0.7)
+axes[0, 1].set_ylabel('Position (m)')
+axes[0, 1].set_title('End-Effector Position Components')
+axes[0, 1].grid(True, alpha=0.3)
+axes[0, 1].legend()
+
+# Joint trajectories
+for i in range(7):
+    axes[1, 0].plot(q_history[:, i], alpha=0.7, linewidth=1)
+axes[1, 0].set_ylabel('Position (rad)')
+axes[1, 0].set_title('Joint Trajectories (from IK)')
+axes[1, 0].grid(True, alpha=0.3)
+
+# Cube motion
+axes[1, 1].plot(cube_pos_history[:, 0], linewidth=2, label='Cube X')
+axes[1, 1].plot(cube_pos_history[:, 1], linewidth=2, label='Cube Y')
+axes[1, 1].plot(cube_pos_history[:, 2], linewidth=2, label='Cube Z')
+axes[1, 1].set_ylabel('Position (m)')
+axes[1, 1].set_title('Cube Position Over Time')
+axes[1, 1].grid(True, alpha=0.3)
+axes[1, 1].legend()
+
+plt.tight_layout()
+plt.savefig('stage4_cartesian_ik.png', dpi=100)
+print(f"\nPlot saved to: stage4_cartesian_ik.png")
+plt.show()
