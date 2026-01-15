@@ -402,15 +402,21 @@ def main():
         data.qpos[:7] = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
         
         # Set cube position (find cube freejoint in qpos)
-        # Cube freejoint: 7 qpos values starting after arm joints
-        # Format: [x, y, z, qw, qx, qy, qz]
-        cube_qpos_start = 7  # After 7 arm joints
-        data.qpos[cube_qpos_start:cube_qpos_start+3] = cube_pos
-        data.qpos[cube_qpos_start+3:cube_qpos_start+7] = [1, 0, 0, 0]  # Identity quaternion
+        # Resolve cube freejoint joint index from the model to avoid hardcoded offsets.
+        # Assumes the MuJoCo XML defines a joint named "cube_freejoint" for the cube body.
+        cube_joint_name = "cube_freejoint"
+        cube_joint_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, cube_joint_name)
+        if cube_joint_id < 0:
+            raise RuntimeError(f"Cube freejoint '{cube_joint_name}' not found in the MuJoCo model.")
         
-        # Zero cube velocity
-        cube_qvel_start = 7  # After 7 arm joint velocities
-        data.qvel[cube_qvel_start:cube_qvel_start+6] = 0.0  # 6 DOF freejoint velocity
+        # Cube freejoint qpos layout: [x, y, z, qw, qx, qy, qz] (7 values)
+        cube_qpos_start = model.jnt_qposadr[cube_joint_id]
+        data.qpos[cube_qpos_start:cube_qpos_start + 3] = cube_pos
+        data.qpos[cube_qpos_start + 3:cube_qpos_start + 7] = [1, 0, 0, 0]  # Identity quaternion
+        
+        # Zero cube velocity: 6-DOF freejoint velocity in qvel
+        cube_qvel_start = model.jnt_dofadr[cube_joint_id]
+        data.qvel[cube_qvel_start:cube_qvel_start + 6] = 0.0
         
         # Forward sim to settle
         mj.mj_forward(model, data)
