@@ -204,7 +204,6 @@ class RFSNStateMachine:
                         return "LIFT"
                 else:
                     # Fallback to v5 behavior (old grasp quality check)
-                    has_contact = grasp_quality.get('has_contact', False)
                     is_attached = grasp_quality.get('is_attached', False)
                     
                     if time_ok and quality_ok:
