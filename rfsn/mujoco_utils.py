@@ -591,12 +591,18 @@ def compute_attachment_proxy(history: GraspHistoryBuffer, min_steps: int = 10) -
     # Compute height correlation (object and EE should move together)
     obj_heights = np.array(history.obj_heights)
     ee_heights = np.array(history.ee_heights)
-    if len(obj_heights) > 1 and np.std(ee_heights) > 0.001:  # Avoid division by zero
+    # Use configured epsilon to avoid computing correlation when EE height is (nearly) stationary
+    # This prevents numerical issues (e.g., division by zero) in correlation computation.
+    if len(obj_heights) > 1 and np.std(ee_heights) > GraspValidationConfig.HEIGHT_STD_EPSILON:
         correlation = np.corrcoef(obj_heights, ee_heights)[0, 1]
         result['height_correlation'] = correlation if not np.isnan(correlation) else 0.0
     
     # Attachment thresholds (from config)
     cfg = GraspValidationConfig
+    # Ensure height std epsilon is available in config; default preserves existing behavior.
+    if not hasattr(cfg, 'HEIGHT_STD_EPSILON'):
+        # HEIGHT_STD_EPSILON prevents correlation computation when EE is stationary.
+        cfg.HEIGHT_STD_EPSILON = 0.001
     
     # Determine if attached
     pos_stable = rel_pos_std_norm < cfg.ATTACHMENT_POS_STD_THRESHOLD
