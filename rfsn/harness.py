@@ -271,7 +271,7 @@ class RFSNHarness:
         return obs
     
     def end_episode(self, success: bool = False, failure_reason: str = None):
-        """End current episode and update learning with safety coupling."""
+        """End current episode and update learning with correct attribution."""
         self.episode_active = False
         
         # Update learner if enabled
@@ -281,42 +281,96 @@ class RFSNHarness:
                 self.decision_history
             )
             
-            # Track which (state, profile) pairs were used and count severe events per pair
-            state_profile_usage = {}  # (state, profile) -> {'count': int, 'severe_events': int}
+            # V5: Track (state, profile) usage with time-windowed attribution
+            # Attribution: Profile must be active for at least K steps or event within N steps of switch
+            MIN_ACTIVE_STEPS = 5  # Profile must be active this long to be attributed
+            SWITCH_WINDOW_STEPS = 3  # Or event within this many steps of switching to profile
+            
+            state_profile_usage = {}  # (state, profile) -> usage info
+            
+            # Track when each (state, profile) became active
+            current_state_profile = None
+            active_since_step = 0
             
             for i, decision in enumerate(self.decision_history):
                 # Extract profile name from rollback token
-                profile_name = decision.rollback_token.split('_')[1] if '_' in decision.rollback_token else 'base'
+                profile_name = 'base'
+                if hasattr(decision, 'rollback_token') and decision.rollback_token:
+                    if '_' in decision.rollback_token:
+                        parts = decision.rollback_token.split('_')
+                        if len(parts) >= 2:
+                            profile_name = parts[1]
+                
                 key = (decision.task_mode, profile_name)
                 
+                # Detect state/profile switch
+                if current_state_profile != key:
+                    current_state_profile = key
+                    active_since_step = i
+                
+                # Initialize usage tracking
                 if key not in state_profile_usage:
-                    state_profile_usage[key] = {'count': 0, 'severe_events': 0}
+                    state_profile_usage[key] = {
+                        'count': 0,
+                        'severe_events': 0,
+                        'attributed_severe_events': 0,  # Only attributed events
+                    }
                 
                 state_profile_usage[key]['count'] += 1
                 
-                # Count severe events at this step
+                # Check for severe events at this step
                 if i < len(self.obs_history):
                     obs = self.obs_history[i]
-                    if (obs.self_collision or obs.table_collision or 
-                        obs.penetration > 0.05 or obs.torque_sat_count >= 5):
+                    is_severe = (obs.self_collision or obs.table_collision or 
+                                obs.penetration > 0.05 or obs.torque_sat_count >= 5)
+                    
+                    if is_severe:
                         state_profile_usage[key]['severe_events'] += 1
+                        
+                        # V5: Only attribute if profile was active long enough OR within switch window
+                        steps_active = i - active_since_step
+                        if steps_active >= MIN_ACTIVE_STEPS or steps_active <= SWITCH_WINDOW_STEPS:
+                            state_profile_usage[key]['attributed_severe_events'] += 1
+                            
+                            # Log attribution event
+                            if self.logger:
+                                self.logger._log_event('severe_event_attributed', obs.t, {
+                                    'state': decision.task_mode,
+                                    'profile': profile_name,
+                                    'steps_active': steps_active,
+                                    'reason': 'sufficient_activity' if steps_active >= MIN_ACTIVE_STEPS else 'switch_window'
+                                })
             
-            # Update stats and poison profiles with repeated severe events
+            # Update stats and check for poisoning/rollback
             for (state, profile), usage_info in state_profile_usage.items():
-                # Update learner statistics
+                # Update learner statistics with attributed events
                 profile_score = score / len(state_profile_usage)  # Distribute score
-                profile_violations = usage_info['severe_events']
+                profile_violations = usage_info['attributed_severe_events']
                 
                 self.learner.update_stats(state, profile, profile_score, profile_violations, self.t)
                 
-                # Check if this profile should be poisoned (2+ severe events in last 5 uses)
+                # V5: Check if profile should be poisoned (stricter criteria)
+                # Poison if: 2+ attributed severe events in last 5 uses
                 stats = self.learner.stats.get((state, profile))
-                if stats and stats.N >= 5 and hasattr(stats, 'recent_scores') and len(stats.recent_scores) >= 5:
+                if stats and stats.N >= 5:
                     recent_severe_count = sum(1 for s in stats.recent_scores[-5:] if s < -5.0)
                     if recent_severe_count >= 2:
-                        # Poison this profile to prevent future selection
+                        # Poison this profile and trigger rollback
                         self.safety_clamp.poison_profile(state, profile)
-                        print(f"[HARNESS] Poisoned ({state}, {profile}) due to repeated severe events")
+                        rollback_profile = self.learner.trigger_rollback(state, profile)
+                        
+                        # Log rollback event
+                        if self.logger:
+                            self.logger._log_event('profile_rollback', self.t, {
+                                'state': state,
+                                'bad_profile': profile,
+                                'rollback_to': rollback_profile,
+                                'reason': f'repeated_severe_events_in_window',
+                                'recent_severe_count': recent_severe_count,
+                            })
+                        
+                        print(f"[HARNESS] Poisoned and rolled back ({state}, {profile}) → {rollback_profile}")
+
 
         
         if self.logger:
