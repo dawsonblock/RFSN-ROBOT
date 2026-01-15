@@ -31,7 +31,7 @@ try:
     OSQP_AVAILABLE = True
 except ImportError:
     OSQP_AVAILABLE = False
-    print("[MPC] WARNING: OSQP not available, falling back to gradient-based MPC")
+    # Warning will be printed when QP MPC is instantiated, not at import time
 
 
 @dataclass
@@ -540,6 +540,10 @@ class RecedingHorizonMPCQP:
         """
         self.config = config or MPCConfig()
         
+        # Print warning once if OSQP not available
+        if not OSQP_AVAILABLE:
+            print("[MPC_QP] WARNING: OSQP not available, will fall back to gradient-based MPC")
+        
         # OSQP solver instance (created per horizon)
         self.solver = None
         self.prev_horizon = None
@@ -631,6 +635,8 @@ class RecedingHorizonMPCQP:
                 P[idx_u + i, idx_u + i] = R[i]
             
             # Smoothness cost: (u_t - u_{t-1})^T R_du (u_t - u_{t-1})
+            # Note: Using scalar du_penalty uniformly across all joints.
+            # Future enhancement: Consider per-joint du_penalty vector for more flexible tuning.
             if t > 0:
                 idx_u_prev = (t - 1) * (n_states + n_controls) + n_states
                 for i in range(7):

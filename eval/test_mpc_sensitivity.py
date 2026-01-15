@@ -22,6 +22,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from rfsn.mpc_receding import RecedingHorizonMPCQP, MPCConfig, OSQP_AVAILABLE
 
 
+# Test configuration constants
+CONVERGENCE_POSITION_THRESHOLD = 0.15  # rad - position error for convergence
+CONVERGENCE_VELOCITY_THRESHOLD = 0.2   # rad/s - velocity threshold for convergence
+
+
 def run_mpc_trajectory(config_name, mpc_config, decision_params, seed=42):
     """
     Run a simple trajectory with given MPC config.
@@ -111,13 +116,11 @@ def run_mpc_trajectory(config_name, mpc_config, decision_params, seed=42):
         
         metrics['total_steps'] += 1
         
-        # Check convergence - more lenient
-        if np.linalg.norm(q - q_target) < 0.15 and np.linalg.norm(qd) < 0.2:
+        # Check convergence
+        if np.linalg.norm(q - q_target) < CONVERGENCE_POSITION_THRESHOLD and np.linalg.norm(qd) < CONVERGENCE_VELOCITY_THRESHOLD:
             break
     
-    total_time = time.perf_counter() - start_time
-    
-    # Compute aggregate metrics
+    # Compute aggregate metrics (total_time not used, removed)
     avg_solve_time = np.mean(metrics['solve_times'])
     max_solve_time = np.max(metrics['solve_times'])
     smoothness = np.mean(metrics['qdd_changes'])  # Lower is smoother
@@ -267,9 +270,11 @@ def test_mpc_sensitivity():
     criterion_1 = energy_diff_pct > 50.0 or smoothness_diff_pct > 50.0
     criteria_met.append((f"Different behavior (energy diff {energy_diff_pct:.1f}%, smoothness diff {smoothness_diff_pct:.1f}%)", criterion_1))
     
-    # 2. Config A is smoother (lower Δqdd)
-    criterion_2 = metrics_a['smoothness'] < metrics_b['smoothness'] * 1.1  # Allow 10% tolerance
-    criteria_met.append((f"Config A smoother ({metrics_a['smoothness']:.4f} < {metrics_b['smoothness']:.4f})", criterion_2))
+    # 2. Config A is smoother (lower Δqdd) - allow for some tolerance
+    # Config A should be smoother, meaning metrics_a['smoothness'] < metrics_b['smoothness']
+    # We allow Config B to be up to 10% worse (higher smoothness value)
+    criterion_2 = metrics_a['smoothness'] <= metrics_b['smoothness']
+    criteria_met.append((f"Config A smoother or equal ({metrics_a['smoothness']:.4f} <= {metrics_b['smoothness']:.4f})", criterion_2))
     
     # 3. Solve time within budget (< 50ms for most steps)
     criterion_3a = metrics_a['max_solve_time'] < 100.0  # Allow some slack

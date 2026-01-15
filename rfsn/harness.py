@@ -29,7 +29,7 @@ from rfsn.profiles import ProfileLibrary
 from rfsn.learner import SafeLearner
 from rfsn.safety import SafetyClamp
 from rfsn.logger import RFSNLogger
-from rfsn.mujoco_utils import build_obs_packet, init_id_cache, self_test_contact_parsing
+from rfsn.mujoco_utils import build_obs_packet, init_id_cache, self_test_contact_parsing, GraspValidationConfig
 
 
 class RFSNHarness:
@@ -512,7 +512,6 @@ class RFSNHarness:
                 
                 # V10: Force gating during PLACE
                 # Reduce stiffness if contact force exceeds threshold
-                from rfsn.mujoco_utils import GraspValidationConfig
                 force_gate_threshold = GraspValidationConfig.FORCE_GATE_THRESHOLD
                 if obs.cube_table_fN > force_gate_threshold or obs.ee_table_fN > force_gate_threshold:
                     # Reduce downward stiffness to prevent excessive force

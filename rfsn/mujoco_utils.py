@@ -12,6 +12,9 @@ from rfsn.obs_packet import ObsPacket
 # Global cache for resolved IDs (initialized once per model)
 _ID_CACHE = None
 
+# Module-level flag to print force proxy warning only once
+_FORCE_PROXY_WARNING_SHOWN = False
+
 
 class GeomBodyIDs:
     """
@@ -782,7 +785,11 @@ def compute_contact_wrenches(model: mj.MjModel, data: mj.MjData, geom_pairs=None
     
     if not has_proper_api:
         # Fallback: penetration-based proxy (for gating only)
-        print("[MUJOCO_UTILS] WARNING: mj.mj_contactForce not available, using penetration proxy")
+        # Print warning only once using a module-level flag
+        global _FORCE_PROXY_WARNING_SHOWN
+        if not _FORCE_PROXY_WARNING_SHOWN:
+            print("[MUJOCO_UTILS] WARNING: mj.mj_contactForce not available, using penetration proxy")
+            _FORCE_PROXY_WARNING_SHOWN = True
         
         for i in range(data.ncon):
             contact = data.contact[i]
