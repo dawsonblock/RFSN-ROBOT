@@ -282,8 +282,12 @@ class RFSNHarness:
             q_target = self.baseline_target_q.copy()
         
         # V7: MPC integration - compute control using MPC or fallback to ID
-        use_mpc = (self.mpc_enabled and not self.mpc_disabled_for_episode and 
-                   decision is not None and self.safety_clamp.last_severe_event is None)
+        use_mpc = (
+            self.mpc_enabled
+            and not self.mpc_disabled_for_episode
+            and decision is not None
+            and (self.safety_clamp is None or self.safety_clamp.last_severe_event is None)
+        )
         
         q_ref = q_target  # Default: track IK target directly
         qd_ref = np.zeros(7)  # Default: zero velocity target
