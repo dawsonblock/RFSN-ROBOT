@@ -607,28 +607,6 @@ class RecedingHorizonMPCQP:
         B_dyn = np.zeros((n_states, n_controls))
         B_dyn[7:, :] = dt * np.eye(7)  # qd_{t+1} = qd_t + dt * qdd_t
         
-        # Build constraint matrix for dynamics
-        # Constraint: -x_{t+1} + A x_t + B u_t = 0
-        # This gives us H constraints of the form: A_eq z = b_eq
-        constraints_list = []
-        for t in range(H):
-            # Indices in decision variable
-            idx_x_t = t * (n_states + n_controls)
-            idx_u_t = idx_x_t + n_states
-            idx_x_tp1 = idx_u_t + n_controls
-            
-            # Build row for this constraint
-            row = np.zeros(n_z)
-            row[idx_x_t:idx_x_t + n_states] = A_dyn.flatten()  # Wrong - need to fix
-            # Actually, we need separate rows for each state dimension
-            
-        # Simpler approach: Build constraint matrix directly
-        # Let's use a more efficient formulation: condense out states
-        # x_t = A^t x_0 + Σ_{i=0}^{t-1} A^{t-1-i} B u_i
-        
-        # For now, use a simpler direct transcription approach
-        # We'll build P and q for the QP cost, and A for constraints
-        
         # Cost matrix P (quadratic term)
         P = sparse.lil_matrix((n_z, n_z))
         q_vec = np.zeros(n_z)
