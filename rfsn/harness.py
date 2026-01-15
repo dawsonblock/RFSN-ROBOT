@@ -159,7 +159,7 @@ class RFSNHarness:
         self.mpc_cached_qd_ref = None
         
         if self.mpc_enabled:
-            from rfsn.mpc_receding import RecedingHorizonMPC, MPCConfig
+            from rfsn.mpc_receding import RecedingHorizonMPCQP, MPCConfig
             mpc_config = MPCConfig(
                 H_min=5,
                 H_max=30,
@@ -168,8 +168,9 @@ class RFSNHarness:
                 learning_rate=0.1,
                 warm_start=True
             )
-            self.mpc_solver = RecedingHorizonMPC(mpc_config)
-            print(f"[HARNESS] MPC_TRACKING mode enabled - replanning every {self.mpc_planning_interval} steps")
+            # V10: Use QP-based MPC for predictable runtime
+            self.mpc_solver = RecedingHorizonMPCQP(mpc_config)
+            print(f"[HARNESS] MPC_TRACKING mode enabled (V10 QP solver) - replanning every {self.mpc_planning_interval} steps")
         else:
             print("[HARNESS] ID_SERVO mode (v6 baseline) - using inverse dynamics PD control")
         
