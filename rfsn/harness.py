@@ -271,13 +271,14 @@ class RFSNHarness:
                 self.learner.update_stats(state, profile, profile_score, profile_violations, self.t)
                 
                 # Check if this profile should be poisoned (2+ severe events in last 5 uses)
-                stats = self.learner.stats[(state, profile)]
-                if stats.N >= 5 and hasattr(stats, 'recent_scores'):
+                stats = self.learner.stats.get((state, profile))
+                if stats and stats.N >= 5 and hasattr(stats, 'recent_scores') and len(stats.recent_scores) >= 5:
                     recent_severe_count = sum(1 for s in stats.recent_scores[-5:] if s < -5.0)
                     if recent_severe_count >= 2:
                         # Poison this profile to prevent future selection
                         self.safety_clamp.poison_profile(state, profile)
                         print(f"[HARNESS] Poisoned ({state}, {profile}) due to repeated severe events")
+
         
         if self.logger:
             self.logger.end_episode(success, failure_reason)
@@ -420,11 +421,12 @@ class RFSNHarness:
         gripper_width = obs.gripper.get('width', 0.0)
         is_closed = gripper_width < 0.06  # Gripper should be mostly closed
         
-        # Check relative motion (object should move with EE)
+        # Check relative motion (EE velocity as proxy for grasp stability)
+        # Note: ObsPacket doesn't include object velocity, so we use EE velocity
+        # which should be low during stable grasp
         if obs.x_obj_pos is not None:
-            # Object velocity should be small relative to workspace
-            obj_vel_norm = np.linalg.norm(obs.xd_ee_lin)
-            is_low_motion = obj_vel_norm < 0.1  # Less than 10cm/s
+            ee_vel_norm = np.linalg.norm(obs.xd_ee_lin)
+            is_low_motion = ee_vel_norm < 0.1  # Less than 10cm/s
         else:
             is_low_motion = True
         

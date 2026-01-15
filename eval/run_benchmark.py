@@ -87,12 +87,14 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
             # Success if cube is stable and displaced from initial position
             if step > 500 and obs.x_obj_pos is not None and initial_cube_pos is not None:
                 displacement = np.linalg.norm(obs.x_obj_pos[:2] - initial_cube_pos[:2])
-                obj_vel = np.linalg.norm(obs.xd_ee_lin) if hasattr(obs, 'xd_ee_lin') else 0.0
+                # Note: ObsPacket doesn't include object velocity, so we check EE velocity
+                # as a proxy for system stability
+                ee_vel = np.linalg.norm(obs.xd_ee_lin) if hasattr(obs, 'xd_ee_lin') else 0.0
                 
                 # Check every 100 steps if stable displacement achieved
                 if step % 100 == 0:
-                    # Success: cube displaced and relatively stable
-                    if displacement > min_displacement and obj_vel < 0.05:
+                    # Success: cube displaced and system relatively stable
+                    if displacement > min_displacement and ee_vel < 0.05:
                         return True, None
         
         # Safety violations (apply to all modes)
