@@ -86,10 +86,11 @@ class RFSNHarness:
             mode: Control mode ("mpc_only", "rfsn", "rfsn_learning")
             task_name: Task name
             logger: Optional logger
-            controller_mode: "ID_SERVO" (v6 baseline) or "MPC_TRACKING" (v7 real MPC)
+            controller_mode: "ID_SERVO" (v6 baseline), "MPC_TRACKING" (v7 joint-space MPC),
+                           "TASK_SPACE_MPC" (v8 task-space MPC), or "IMPEDANCE" (v8 force control)
         """
         assert mode in ["mpc_only", "rfsn", "rfsn_learning"]
-        assert controller_mode in ["ID_SERVO", "MPC_TRACKING"]
+        assert controller_mode in ["ID_SERVO", "MPC_TRACKING", "TASK_SPACE_MPC", "IMPEDANCE"]
         
         self.model = model
         self.data = data
@@ -142,7 +143,7 @@ class RFSNHarness:
         self.decision_history = []
         self.initial_cube_z = None  # Track initial cube height for grasp quality
         
-        # V7: MPC integration
+        # V7: Joint-space MPC integration
         self.mpc_enabled = (controller_mode == "MPC_TRACKING")
         self.mpc_solver = None
         self.mpc_steps_used = 0
@@ -165,6 +166,34 @@ class RFSNHarness:
             print("[HARNESS] MPC_TRACKING mode enabled - using real receding horizon MPC")
         else:
             print("[HARNESS] ID_SERVO mode (v6 baseline) - using inverse dynamics PD control")
+        
+        # V8: Task-space MPC integration
+        self.task_space_mpc_enabled = (controller_mode == "TASK_SPACE_MPC")
+        self.task_space_solver = None
+        self.task_space_steps_used = 0
+        
+        if self.task_space_mpc_enabled:
+            from rfsn.mpc_task_space import TaskSpaceRecedingHorizonMPC, TaskSpaceMPCConfig
+            ts_config = TaskSpaceMPCConfig(
+                H_min=5,
+                H_max=30,
+                max_iterations=100,
+                time_budget_ms=50.0,
+                learning_rate=0.05,
+                warm_start=True
+            )
+            self.task_space_solver = TaskSpaceRecedingHorizonMPC(model, ts_config)
+            print("[HARNESS] TASK_SPACE_MPC mode enabled - using task-space receding horizon MPC")
+        
+        # V8: Impedance control integration
+        self.impedance_enabled = (controller_mode == "IMPEDANCE")
+        self.impedance_controller = None
+        
+        if self.impedance_enabled:
+            from rfsn.impedance_controller import ImpedanceController, ImpedanceProfiles
+            self.impedance_controller = ImpedanceController(model)
+            self.impedance_profiles = ImpedanceProfiles()
+            print("[HARNESS] IMPEDANCE mode enabled - using force-based impedance control")
         
         # V6: Grasp validation history buffer
         self.grasp_history = None
@@ -190,6 +219,12 @@ class RFSNHarness:
         
         if self.mpc_solver:
             self.mpc_solver.reset_warm_start()
+        
+        # V8: Reset task-space MPC tracking
+        self.task_space_steps_used = 0
+        
+        if self.task_space_solver:
+            self.task_space_solver.reset_warm_start()
         
         # Reset grasp validation history
         if self.grasp_history:
@@ -351,8 +386,93 @@ class RFSNHarness:
                 obs.fallback_used = True
                 obs.mpc_failure_reason = "disabled_for_episode"
         
-        # Compute control (inverse dynamics tracking q_ref, qd_ref)
-        tau = self._inverse_dynamics_control(obs.q, obs.qd, q_ref, qd_ref, decision)
+        # V8: Task-space MPC integration
+        if self.task_space_mpc_enabled and decision is not None:
+            try:
+                # Prepare task-space MPC parameters
+                ts_mpc_params = {
+                    'horizon_steps': decision.horizon_steps,
+                    'Q_pos_task': decision.Q_diag[:3],  # Use first 3 for position
+                    'Q_ori_task': decision.Q_diag[3:6] * 0.1,  # Scale down for orientation
+                    'Q_vel_task': decision.Q_diag[7:13],  # Velocity penalty
+                    'R_diag': decision.R_diag,
+                    'terminal_Q_pos': decision.terminal_Q_diag[:3],
+                    'terminal_Q_ori': decision.terminal_Q_diag[3:6] * 0.1,
+                    'du_penalty': decision.du_penalty
+                }
+                
+                # Solve task-space MPC
+                ts_result = self.task_space_solver.solve(
+                    obs.q, obs.qd,
+                    decision.x_target_pos, decision.x_target_quat,
+                    self.dt, ts_mpc_params
+                )
+                
+                if ts_result.converged or ts_result.reason == "max_iters":
+                    # Use task-space MPC output
+                    q_ref = ts_result.q_ref_next
+                    qd_ref = ts_result.qd_ref_next
+                    self.task_space_steps_used += 1
+                    obs.controller_mode = "TASK_SPACE_MPC"
+                    obs.mpc_converged = ts_result.converged
+                    obs.mpc_solve_time_ms = ts_result.solve_time_ms
+                    obs.mpc_iters = ts_result.iters
+                else:
+                    # Fallback to IK target
+                    self._handle_mpc_failure(obs, f"task_space_{ts_result.reason}")
+            except Exception as e:
+                # Task-space MPC exception, fallback to IK without contaminating joint-space MPC counters
+                obs.controller_mode = "ID_SERVO"
+                obs.fallback_used = True
+                obs.mpc_failure_reason = "task_space_exception"
+                obs.mpc_converged = False
+
+                if self.logger:
+                    self.logger.log_event("mpc_failure", {
+                        "t": float(self.t),
+                        "reason": "task_space_exception",
+                        "exception_type": type(e).__name__,
+                        "exception": repr(e),
+                    })
+        
+        # V8: Impedance control mode (for contact-rich states)
+        use_impedance = self.impedance_enabled and decision is not None
+        
+        if use_impedance:
+            # Choose impedance profile based on state
+            if decision.task_mode == "GRASP":
+                # Start soft, then firm after contact
+                if obs.ee_contact or obs.obj_contact:
+                    impedance_config = self.impedance_profiles.grasp_firm()
+                else:
+                    impedance_config = self.impedance_profiles.grasp_soft()
+            elif decision.task_mode == "PLACE":
+                impedance_config = self.impedance_profiles.place_gentle()
+            elif decision.task_mode in ["LIFT", "TRANSPORT"]:
+                impedance_config = self.impedance_profiles.transport_stable()
+            else:
+                # Default: use standard impedance
+                impedance_config = self.impedance_profiles.transport_stable()
+            
+            # Update controller config
+            self.impedance_controller.update_config(impedance_config)
+
+            # Compute impedance control torques directly
+            tau = self.impedance_controller.compute_torques(
+                self.data,
+                decision.x_target_pos,
+                decision.x_target_quat,
+                nullspace_target_q=q_target  # Use IK solution for null-space
+            )
+
+            # Preserve profile-driven torque scaling safety behavior
+            if decision is not None:
+                tau = np.clip(tau * float(decision.max_tau_scale), -87.0, 87.0)
+            
+            obs.controller_mode = "IMPEDANCE"
+        else:
+            # Compute control (inverse dynamics tracking q_ref, qd_ref)
+            tau = self._inverse_dynamics_control(obs.q, obs.qd, q_ref, qd_ref, decision)
         
         # Apply control
         self.data.ctrl[:7] = tau
