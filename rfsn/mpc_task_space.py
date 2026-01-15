@@ -333,7 +333,7 @@ class TaskSpaceRecedingHorizonMPC:
             ee_pos_trajectory=ee_pos_traj,
             ee_quat_trajectory=ee_quat_traj,
             cost_history=cost_history,
-            gradient_norm=grad_norm if 'grad_norm' in locals() else 0.0
+            gradient_norm=grad_norm
         )
     
     def _rollout_dynamics(
