@@ -218,9 +218,8 @@ class RFSNLogger:
         
         # Count RECOVER time
         recover_time_steps = 0
-        for event in self.current_episode['events']:
-            if event['event_type'] == 'state_change' and event.get('data', {}).get('new_state') == 'RECOVER':
-                recover_time_steps += 1
+        if decision_history:
+            recover_time_steps = sum(1 for d in decision_history if d.task_mode == 'RECOVER')
         
         # Write to CSV
         with open(self.episodes_csv_path, 'a', newline='') as f:
