@@ -2,6 +2,29 @@
 Profile Library: Safe parameter profiles per state
 ===================================================
 Defines 3-5 variants per state (base, precise, smooth, fast, stable).
+
+CRITICAL: Parameter Mapping to Actual Control
+==============================================
+Despite "MPC" naming, these parameters map to PD control + IK settings:
+
+- horizon_steps:    PROXY for IK iteration count (higher = more precise IK)
+- Q_diag[0:7]:      PROXY for KP gains (position stiffness)
+                    KP_scale = sqrt(Q_pos / 50.0)
+- Q_diag[7:14]:     PROXY for KD gains (velocity damping)
+                    KD_scale = sqrt(Q_vel / 10.0)
+- R_diag:           NOT USED (reserved for control effort penalty)
+- du_penalty:       NOT USED (reserved for smoothing/rate limiting)
+- max_tau_scale:    DIRECT torque multiplier (≤1.0 for safety)
+- contact_policy:   Semantic hint (not enforced in control)
+
+Profile Variant Design Intent:
+- base:      Balanced gains, moderate speed
+- precise:   High Q (stiff), longer horizon (more IK iterations)
+- smooth:    High R (damped), lower tau_scale (gentle)
+- fast:      Short horizon, low R (responsive), high tau_scale
+- stable:    Low Q (compliant), high R (damped), low tau_scale
+
+Learning selects variants via UCB to optimize task performance.
 """
 
 import numpy as np

@@ -43,11 +43,29 @@ class RFSNHarness:
     - "rfsn": RFSN state machine generates EE targets → IK → joint targets → PD
     - "rfsn_learning": Same as "rfsn" with UCB profile learning
     
-    RFSN Profile Knobs Actually Control:
-    - horizon_steps: Not used in current PD implementation
-    - Q_diag: Scales PD position gains (KP)
-    - R_diag: Not directly used (could scale KD in future)
-    - max_tau_scale: Multiplies output torques
+    CRITICAL: Profile "MPC Parameters" Are Actually PD Control Proxies
+    ===================================================================
+    Despite naming, profiles do NOT configure true MPC. They map to PD control:
+    
+    - horizon_steps: PROXY for IK iteration count (more iterations = finer convergence)
+                     NOT an MPC prediction horizon
+    
+    - Q_diag[0:7]:   PROXY for PD position gains (KP_scale = sqrt(Q_pos / 50.0))
+                     Higher Q → higher KP → stiffer position tracking
+    
+    - Q_diag[7:14]:  PROXY for PD velocity gains (KD_scale = sqrt(Q_vel / 10.0))
+                     Higher Q_vel → higher KD → more damping
+    
+    - R_diag:        NOT USED in current implementation
+                     Reserved for future control effort penalty
+    
+    - du_penalty:    NOT USED in current implementation
+                     Reserved for future rate limiting or smoothing
+    
+    - max_tau_scale: Direct torque multiplier (≤1.0 for safety)
+                     Reduces available torque to prevent aggressive motion
+    
+    Learning selects among these proxy profiles, NOT raw control actions.
     """
     
     def __init__(
@@ -301,11 +319,14 @@ class RFSNHarness:
         Convert end-effector target to joint target using damped least squares IK.
         
         Args:
-            decision: Decision containing target pose
+            decision: Decision containing target pose and horizon_steps
             use_orientation: If True, include orientation in IK. If None, auto-decide based on state.
         
         Uses MuJoCo Jacobian and iterative pose-based (position + orientation) IK with damping.
         Orientation is soft-weighted and optional per state for stability.
+        
+        PROXY MAPPING: decision.horizon_steps → IK max_iterations
+        Higher horizon → more IK iterations → finer convergence (but slower)
         """
         q_current = self.data.qpos[:7].copy()
         
@@ -322,7 +343,14 @@ class RFSNHarness:
         alpha = 0.5  # Step size
         damping_pos = 0.01  # Position damping for stability
         damping_rot = 0.05  # Higher rotation damping (orientation is soft)
-        max_iterations = 10
+        
+        # PROXY: Use horizon_steps as max IK iterations (clamped for safety)
+        # More iterations = more precise convergence = "longer planning horizon" metaphor
+        max_iterations = min(max(decision.horizon_steps, 5), 20)  # Clamp to [5, 20]
+        # PROXY: Use horizon_steps as max IK iterations (clamped for safety)
+        # More iterations = more precise convergence = "longer planning horizon" metaphor
+        max_iterations = min(max(decision.horizon_steps, 5), 20)  # Clamp to [5, 20]
+        
         pos_tolerance = 0.01  # 1cm
         ori_tolerance = 0.1   # Quaternion distance tolerance
         
@@ -443,22 +471,35 @@ class RFSNHarness:
         """
         Compute control torques using inverse dynamics.
         
-        Uses MuJoCo's mj_inverse to compute required torques.
+        Uses MuJoCo's mj_inverse to compute required torques for PD control.
+        
+        Profile Parameter Mapping (EXPLICIT):
+        =====================================
+        - Q_diag[0:7]  → KP_scale = sqrt(Q_pos / 50.0) → Position stiffness
+        - Q_diag[7:14] → KD_scale = sqrt(Q_vel / 10.0) → Velocity damping
+        - R_diag       → NOT USED (future: control effort penalty)
+        - du_penalty   → NOT USED (future: acceleration smoothing)
+        - max_tau_scale→ DIRECT multiplier on output torques (safety limiter)
+        
+        This is NOT MPC despite profile naming. It's gain-scheduled PD control.
         """
-        # Apply MPC gains (from decision if available)
+        # Map profile "Q" parameters to PD gains (EXPLICIT PROXY MAPPING)
         if decision:
-            # Scale KP based on Q weights
-            kp_scale = np.sqrt(decision.Q_diag[:7] / 50.0)  # Normalized to base
+            # Q_diag[0:7] controls position stiffness via KP scaling
+            kp_scale = np.sqrt(decision.Q_diag[:7] / 50.0)  # Normalized to base=50
             KP_local = self.KP * kp_scale
             
-            # Scale KD based on Q velocity weights
-            kd_scale = np.sqrt(decision.Q_diag[7:14] / 10.0)
+            # Q_diag[7:14] controls velocity damping via KD scaling
+            kd_scale = np.sqrt(decision.Q_diag[7:14] / 10.0)  # Normalized to base=10
             KD_local = self.KD * kd_scale
+            
+            # Note: R_diag and du_penalty are NOT used in current implementation
+            # They exist for potential future extensions (control effort, smoothing)
         else:
             KP_local = self.KP
             KD_local = self.KD
         
-        # PD control
+        # PD control law
         q_error = q_target - q
         dq_desired = KP_local * q_error
         
@@ -467,16 +508,16 @@ class RFSNHarness:
         data_temp.qpos[:] = self.data.qpos
         data_temp.qvel[:] = self.data.qvel
         
-        # Set desired acceleration
+        # Set desired acceleration (PD output)
         qacc_full = np.zeros(self.model.nv)
         qacc_full[:7] = dq_desired - KD_local * qd
         data_temp.qacc[:] = qacc_full
         
-        # Compute inverse dynamics
+        # Compute inverse dynamics (maps acceleration to torques)
         mj.mj_inverse(self.model, data_temp)
         tau = data_temp.qfrc_inverse[:7].copy()
         
-        # Apply torque scale if decision provided
+        # Apply torque scale (PROXY: max_tau_scale as safety limiter)
         if decision:
             tau *= decision.max_tau_scale
         
