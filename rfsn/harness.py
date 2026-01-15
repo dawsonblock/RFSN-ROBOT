@@ -152,6 +152,12 @@ class RFSNHarness:
         self.mpc_disabled_for_episode = False
         self.mpc_solve_times = []  # Track solve times for averaging
         
+        # V8 Fix: MPC planning cadence (plan every N steps, track between)
+        self.mpc_planning_interval = 5  # Replan every 5 steps (pragmatic fix for runtime)
+        self.mpc_last_plan_step = -999  # Force planning on first step
+        self.mpc_cached_q_ref = None
+        self.mpc_cached_qd_ref = None
+        
         if self.mpc_enabled:
             from rfsn.mpc_receding import RecedingHorizonMPC, MPCConfig
             mpc_config = MPCConfig(
@@ -163,7 +169,7 @@ class RFSNHarness:
                 warm_start=True
             )
             self.mpc_solver = RecedingHorizonMPC(mpc_config)
-            print("[HARNESS] MPC_TRACKING mode enabled - using real receding horizon MPC")
+            print(f"[HARNESS] MPC_TRACKING mode enabled - replanning every {self.mpc_planning_interval} steps")
         else:
             print("[HARNESS] ID_SERVO mode (v6 baseline) - using inverse dynamics PD control")
         
@@ -171,6 +177,12 @@ class RFSNHarness:
         self.task_space_mpc_enabled = (controller_mode == "TASK_SPACE_MPC")
         self.task_space_solver = None
         self.task_space_steps_used = 0
+        
+        # V8 Fix: Task-space MPC planning cadence
+        self.task_space_planning_interval = 5  # Replan every 5 steps
+        self.task_space_last_plan_step = -999  # Force planning on first step
+        self.task_space_cached_q_ref = None
+        self.task_space_cached_qd_ref = None
         
         if self.task_space_mpc_enabled:
             from rfsn.mpc_task_space import TaskSpaceRecedingHorizonMPC, TaskSpaceMPCConfig
@@ -183,7 +195,7 @@ class RFSNHarness:
                 warm_start=True
             )
             self.task_space_solver = TaskSpaceRecedingHorizonMPC(model, ts_config)
-            print("[HARNESS] TASK_SPACE_MPC mode enabled - using task-space receding horizon MPC")
+            print(f"[HARNESS] TASK_SPACE_MPC mode enabled - replanning every {self.task_space_planning_interval} steps")
         
         # V8: Impedance control integration
         self.impedance_enabled = (controller_mode == "IMPEDANCE")
@@ -216,12 +228,18 @@ class RFSNHarness:
         self.mpc_failure_streak = 0
         self.mpc_disabled_for_episode = False
         self.mpc_solve_times = []
+        self.mpc_last_plan_step = -999  # Force planning on first step
+        self.mpc_cached_q_ref = None
+        self.mpc_cached_qd_ref = None
         
         if self.mpc_solver:
             self.mpc_solver.reset_warm_start()
         
         # V8: Reset task-space MPC tracking
         self.task_space_steps_used = 0
+        self.task_space_last_plan_step = -999  # Force planning on first step
+        self.task_space_cached_q_ref = None
+        self.task_space_cached_qd_ref = None
         
         if self.task_space_solver:
             self.task_space_solver.reset_warm_start()
@@ -241,8 +259,6 @@ class RFSNHarness:
             ObsPacket with current observation
         """
         # Build observation
-        t_mpc_start = time.perf_counter()
-        
         obs = build_obs_packet(
             self.model,
             self.data,
@@ -329,56 +345,78 @@ class RFSNHarness:
         mpc_result = None
         
         if use_mpc:
-            # Try MPC solve
-            try:
-                # Prepare decision parameters for MPC
-                mpc_params = {
-                    'horizon_steps': decision.horizon_steps,
-                    'Q_diag': decision.Q_diag,
-                    'R_diag': decision.R_diag,
-                    'terminal_Q_diag': decision.terminal_Q_diag,
-                    'du_penalty': decision.du_penalty,
-                    'joint_limit_proximity': obs.joint_limit_proximity
-                }
-                
-                # Get joint limits from model
-                joint_limits = (self.model.jnt_range[:7, 0], self.model.jnt_range[:7, 1])
-                
-                # Solve MPC
-                mpc_result = self.mpc_solver.solve(
-                    obs.q, obs.qd, q_target, self.dt, mpc_params, joint_limits
-                )
-                
-                # Check if MPC succeeded
-                if mpc_result.converged or mpc_result.reason == "max_iters":
-                    # Use MPC output as reference for ID controller
-                    q_ref = mpc_result.q_ref_next
-                    qd_ref = mpc_result.qd_ref_next
+            # V8 Fix: Pragmatic MPC cadence - only replan every N steps
+            steps_since_plan = self.step_count - self.mpc_last_plan_step
+            should_replan = steps_since_plan >= self.mpc_planning_interval
+            
+            if should_replan:
+                # Time to replan - run MPC solver
+                try:
+                    # Prepare decision parameters for MPC
+                    mpc_params = {
+                        'horizon_steps': decision.horizon_steps,
+                        'Q_diag': decision.Q_diag,
+                        'R_diag': decision.R_diag,
+                        'terminal_Q_diag': decision.terminal_Q_diag,
+                        'du_penalty': decision.du_penalty,
+                        'joint_limit_proximity': obs.joint_limit_proximity
+                    }
                     
-                    # Update tracking
-                    self.mpc_steps_used += 1
-                    self.mpc_failure_streak = 0
-                    self.mpc_solve_times.append(mpc_result.solve_time_ms)
+                    # Get joint limits from model
+                    joint_limits = (self.model.jnt_range[:7, 0], self.model.jnt_range[:7, 1])
                     
-                    # Update obs with MPC diagnostics
-                    obs.controller_mode = "MPC_TRACKING"
-                    obs.mpc_converged = mpc_result.converged
-                    obs.mpc_solve_time_ms = mpc_result.solve_time_ms
-                    obs.mpc_iters = mpc_result.iters
-                    self._handle_mpc_failure(obs, mpc_result.reason)
+                    # Solve MPC
+                    mpc_result = self.mpc_solver.solve(
+                        obs.q, obs.qd, q_target, self.dt, mpc_params, joint_limits
+                    )
+                    
+                    # Check if MPC succeeded
+                    if mpc_result.converged or mpc_result.reason == "max_iters":
+                        # Use MPC output as reference for ID controller
+                        q_ref = mpc_result.q_ref_next
+                        qd_ref = mpc_result.qd_ref_next
+                        
+                        # Cache for tracking between replans
+                        self.mpc_cached_q_ref = q_ref
+                        self.mpc_cached_qd_ref = qd_ref
+                        self.mpc_last_plan_step = self.step_count
+                        
+                        # Update tracking
+                        self.mpc_steps_used += 1
+                        self.mpc_failure_streak = 0
+                        self.mpc_solve_times.append(mpc_result.solve_time_ms)
+                        
+                        # Update obs with MPC diagnostics
+                        obs.controller_mode = "MPC_TRACKING"
+                        obs.mpc_converged = mpc_result.converged
+                        obs.mpc_solve_time_ms = mpc_result.solve_time_ms
+                        obs.mpc_iters = mpc_result.iters
+                    else:
+                        # MPC failed to converge
+                        self._handle_mpc_failure(obs, mpc_result.reason)
+                        self.mpc_solver.reset_warm_start()  # Prevent warm-starting from failed solution
+                        q_ref = q_target  # Fallback to IK target
+                        qd_ref = np.zeros(7)
+                except Exception as e:
+                    # MPC exception, fallback to ID
+                    self._handle_mpc_failure(obs, f"exception: {str(e)}")
                     self.mpc_solver.reset_warm_start()  # Prevent warm-starting from failed solution
-                    q_ref = q_target  # Fallback to IK target
+                    q_ref = q_target
                     qd_ref = np.zeros(7)
-            except Exception as e:
-                # MPC exception, fallback to ID
-                self._handle_mpc_failure(obs, f"exception: {str(e)}")
-                self.mpc_solver.reset_warm_start()  # Prevent warm-starting from failed solution
-                q_ref = q_target
-            except Exception as e:
-                # MPC exception, fallback to ID
-                self._handle_mpc_failure(obs, f"exception: {str(e)}")
-                q_ref = q_target
-                qd_ref = np.zeros(7)
+            else:
+                # Between replans - use cached MPC reference with ID tracking
+                if self.mpc_cached_q_ref is not None and self.mpc_cached_qd_ref is not None:
+                    q_ref = self.mpc_cached_q_ref
+                    qd_ref = self.mpc_cached_qd_ref
+                    obs.controller_mode = "MPC_TRACKING"
+                    obs.mpc_converged = True  # Tracking cached plan
+                    obs.mpc_solve_time_ms = 0.0  # No solve this step
+                    obs.mpc_iters = 0
+                else:
+                    # No valid cached plan available, use IK
+                    q_ref = q_target
+                    qd_ref = np.zeros(7)
+                    obs.controller_mode = "ID_SERVO"
         else:
             # Not using MPC this step
             obs.controller_mode = "ID_SERVO"
@@ -388,52 +426,74 @@ class RFSNHarness:
         
         # V8: Task-space MPC integration
         if self.task_space_mpc_enabled and decision is not None:
-            try:
-                # Prepare task-space MPC parameters
-                ts_mpc_params = {
-                    'horizon_steps': decision.horizon_steps,
-                    'Q_pos_task': decision.Q_diag[:3],  # Use first 3 for position
-                    'Q_ori_task': decision.Q_diag[3:6] * 0.1,  # Scale down for orientation
-                    'Q_vel_task': decision.Q_diag[7:13],  # Velocity penalty
-                    'R_diag': decision.R_diag,
-                    'terminal_Q_pos': decision.terminal_Q_diag[:3],
-                    'terminal_Q_ori': decision.terminal_Q_diag[3:6] * 0.1,
-                    'du_penalty': decision.du_penalty
-                }
-                
-                # Solve task-space MPC
-                ts_result = self.task_space_solver.solve(
-                    obs.q, obs.qd,
-                    decision.x_target_pos, decision.x_target_quat,
-                    self.dt, ts_mpc_params
-                )
-                
-                if ts_result.converged or ts_result.reason == "max_iters":
-                    # Use task-space MPC output
-                    q_ref = ts_result.q_ref_next
-                    qd_ref = ts_result.qd_ref_next
-                    self.task_space_steps_used += 1
-                    obs.controller_mode = "TASK_SPACE_MPC"
-                    obs.mpc_converged = ts_result.converged
-                    obs.mpc_solve_time_ms = ts_result.solve_time_ms
-                    obs.mpc_iters = ts_result.iters
-                else:
-                    # Fallback to IK target
-                    self._handle_mpc_failure(obs, f"task_space_{ts_result.reason}")
-            except Exception as e:
-                # Task-space MPC exception, fallback to IK without contaminating joint-space MPC counters
-                obs.controller_mode = "ID_SERVO"
-                obs.fallback_used = True
-                obs.mpc_failure_reason = "task_space_exception"
-                obs.mpc_converged = False
+            # V8 Fix: Pragmatic task-space MPC cadence - replan every N steps
+            steps_since_plan = self.step_count - self.task_space_last_plan_step
+            should_replan = steps_since_plan >= self.task_space_planning_interval
+            
+            if should_replan:
+                # Time to replan - run task-space MPC solver
+                try:
+                    # Prepare task-space MPC parameters
+                    ts_mpc_params = {
+                        'horizon_steps': decision.horizon_steps,
+                        'Q_pos_task': decision.Q_diag[:3],  # Use first 3 for position
+                        'Q_ori_task': decision.Q_diag[3:6] * 0.1,  # Scale down for orientation
+                        'Q_vel_task': decision.Q_diag[7:13],  # Velocity penalty
+                        'R_diag': decision.R_diag,
+                        'terminal_Q_pos': decision.terminal_Q_diag[:3],
+                        'terminal_Q_ori': decision.terminal_Q_diag[3:6] * 0.1,
+                        'du_penalty': decision.du_penalty
+                    }
+                    
+                    # Solve task-space MPC
+                    ts_result = self.task_space_solver.solve(
+                        obs.q, obs.qd,
+                        decision.x_target_pos, decision.x_target_quat,
+                        self.dt, ts_mpc_params
+                    )
+                    
+                    if ts_result.converged or ts_result.reason == "max_iters":
+                        # Use task-space MPC output
+                        q_ref = ts_result.q_ref_next
+                        qd_ref = ts_result.qd_ref_next
+                        
+                        # Cache for tracking between replans
+                        self.task_space_cached_q_ref = q_ref
+                        self.task_space_cached_qd_ref = qd_ref
+                        self.task_space_last_plan_step = self.step_count
+                        
+                        self.task_space_steps_used += 1
+                        obs.controller_mode = "TASK_SPACE_MPC"
+                        obs.mpc_converged = ts_result.converged
+                        obs.mpc_solve_time_ms = ts_result.solve_time_ms
+                        obs.mpc_iters = ts_result.iters
+                    else:
+                        # Fallback to IK target
+                        self._handle_mpc_failure(obs, f"task_space_{ts_result.reason}")
+                except Exception as e:
+                    # Task-space MPC exception, fallback to IK without contaminating joint-space MPC counters
+                    obs.controller_mode = "ID_SERVO"
+                    obs.fallback_used = True
+                    obs.mpc_failure_reason = "task_space_exception"
+                    obs.mpc_converged = False
 
-                if self.logger:
-                    self.logger.log_event("mpc_failure", {
-                        "t": float(self.t),
-                        "reason": "task_space_exception",
-                        "exception_type": type(e).__name__,
-                        "exception": repr(e),
-                    })
+                    if self.logger:
+                        self.logger.log_event("mpc_failure", {
+                            "t": float(self.t),
+                            "reason": "task_space_exception",
+                            "exception_type": type(e).__name__,
+                            "exception": repr(e),
+                        })
+            else:
+                # Between replans - use cached task-space MPC reference
+                if self.task_space_cached_q_ref is not None and self.task_space_cached_qd_ref is not None:
+                    q_ref = self.task_space_cached_q_ref
+                    qd_ref = self.task_space_cached_qd_ref
+                    obs.controller_mode = "TASK_SPACE_MPC"
+                    obs.mpc_converged = True  # Tracking cached plan
+                    obs.mpc_solve_time_ms = 0.0  # No solve this step
+                    obs.mpc_iters = 0
+                # else: keep q_ref/qd_ref from IK (fallback)
         
         # V8: Impedance control mode (for contact-rich states)
         use_impedance = self.impedance_enabled and decision is not None
@@ -457,12 +517,16 @@ class RFSNHarness:
             # Update controller config
             self.impedance_controller.update_config(impedance_config)
 
+            # V8 Fix: Enable contact force feedback for PLACE to cap normal force
+            use_contact_feedback = (decision.task_mode == "PLACE")
+
             # Compute impedance control torques directly
             tau = self.impedance_controller.compute_torques(
                 self.data,
                 decision.x_target_pos,
                 decision.x_target_quat,
-                nullspace_target_q=q_target  # Use IK solution for null-space
+                nullspace_target_q=q_target,  # Use IK solution for null-space
+                contact_force_feedback=use_contact_feedback
             )
 
             # Preserve profile-driven torque scaling safety behavior
@@ -498,10 +562,6 @@ class RFSNHarness:
         
         # Step simulation
         mj.mj_step(self.model, self.data)
-        
-        # Update MPC diagnostics
-        mpc_solve_time = (time.perf_counter() - t_mpc_start) * 1000  # ms
-        obs.mpc_solve_time_ms = mpc_solve_time
         
         # Count torque saturation
         torque_sat_count = np.sum(np.abs(tau) >= 86.5)  # Near 87 limit
