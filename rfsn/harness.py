@@ -432,6 +432,7 @@ class RFSNHarness:
                         "t": float(self.t),
                         "reason": "task_space_exception",
                         "exception_type": type(e).__name__,
+                        "exception": repr(e),
                     })
         
         # V8: Impedance control mode (for contact-rich states)
