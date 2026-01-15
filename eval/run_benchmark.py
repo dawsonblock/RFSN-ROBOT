@@ -534,11 +534,11 @@ def run_acceptance_test(args):
     print("=" * 70)
     
     # Temporarily modify profiles for config A
-    profile_lib = ProfileLibrary()
+    profile_lib_a = ProfileLibrary()
     original_profiles = {}
     for state in ["REACH_PREGRASP", "TRANSPORT"]:
-        for variant in profile_lib.profiles[state]:
-            prof = profile_lib.profiles[state][variant]
+        for variant in profile_lib_a.profiles[state]:
+            prof = profile_lib_a.profiles[state][variant]
             original_profiles[(state, variant)] = {
                 'horizon': prof.horizon_steps,
                 'R': prof.R_diag.copy(),
@@ -548,10 +548,11 @@ def run_acceptance_test(args):
             prof.horizon_steps = 8
             prof.R_diag = 0.05 * np.ones(7)
             prof.du_penalty = 0.05
-    
+
     np.random.seed(test_seed)
     logger_a = RFSNLogger(run_dir=args.run_dir + "_configA" if args.run_dir else "runs/acceptance_configA")
-    harness_a = RFSNHarness(model, data, args.mode, args.task, logger_a, controller_mode="MPC_TRACKING")
+    # In harness.py, __init__ should be updated to accept `profile_lib`
+    harness_a = RFSNHarness(model, data, args.mode, args.task, logger_a, controller_mode="MPC_TRACKING", profile_lib=profile_lib_a)
     
     results_a = []
     for ep in range(test_episodes):
