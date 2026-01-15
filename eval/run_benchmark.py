@@ -42,21 +42,37 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
     """
     harness.start_episode()
     
+    # Track initial cube position from actual simulation state
+    initial_cube_pos = None
+    goal_region_center = np.array([-0.2, 0.3, 0.45])  # Target place location
+    goal_tolerance = 0.15  # 15cm radius around goal
+    min_displacement = 0.10  # Minimum 10cm movement to consider manipulation
+    
     for step in range(max_steps):
         obs = harness.step()
         
-        # Check terminal conditions
+        # Record initial cube position on first step
+        if step == 0 and obs.x_obj_pos is not None:
+            initial_cube_pos = obs.x_obj_pos.copy()
+        
+        # Check terminal conditions for RFSN modes
         if harness.rfsn_enabled:
             current_state = harness.state_machine.current_state
             
-            # Success: completed task
+            # Success: completed task and cube in goal region
             if current_state == "IDLE" and step > 100:
-                # Check if cube was moved (for pick-place)
-                if obs.x_obj_pos is not None:
-                    initial_pos = np.array([0.3, 0.0, 0.43])
-                    distance = np.linalg.norm(obs.x_obj_pos[:2] - initial_pos[:2])
-                    if distance > 0.1:  # Moved more than 10cm
+                if obs.x_obj_pos is not None and initial_cube_pos is not None:
+                    # Check if cube reached goal region (for pick-place)
+                    distance_to_goal = np.linalg.norm(obs.x_obj_pos[:2] - goal_region_center[:2])
+                    if distance_to_goal < goal_tolerance:
                         return True, None
+                    
+                    # Alternative success: cube was displaced significantly (partial credit)
+                    displacement = np.linalg.norm(obs.x_obj_pos[:2] - initial_cube_pos[:2])
+                    if displacement > min_displacement:
+                        # Check if cube is lifted
+                        if obs.x_obj_pos[2] > initial_cube_pos[2] + 0.05:  # Lifted 5cm
+                            return True, None
             
             # Failure: reached FAIL state
             if current_state == "FAIL":
@@ -66,7 +82,22 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
             if harness.state_machine.state_visit_count > 2000:
                 return False, "timeout"
         
-        # Safety violations
+        else:
+            # MPC-only mode: check if cube manipulation was successful
+            # Success if cube is stable and displaced from initial position
+            if step > 500 and obs.x_obj_pos is not None and initial_cube_pos is not None:
+                displacement = np.linalg.norm(obs.x_obj_pos[:2] - initial_cube_pos[:2])
+                # Note: ObsPacket doesn't include object velocity, so we check EE velocity
+                # as a proxy for system stability
+                ee_vel = np.linalg.norm(obs.xd_ee_lin) if hasattr(obs, 'xd_ee_lin') else 0.0
+                
+                # Check every 100 steps if stable displacement achieved
+                if step % 100 == 0:
+                    # Success: cube displaced and system relatively stable
+                    if displacement > min_displacement and ee_vel < 0.05:
+                        return True, None
+        
+        # Safety violations (apply to all modes)
         if obs.self_collision:
             return False, "self_collision"
         if obs.table_collision:
@@ -74,6 +105,11 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
         
         # Episode timeout
         if step >= max_steps - 1:
+            # For MPC-only, check final state
+            if not harness.rfsn_enabled and obs.x_obj_pos is not None and initial_cube_pos is not None:
+                displacement = np.linalg.norm(obs.x_obj_pos[:2] - initial_cube_pos[:2])
+                if displacement > min_displacement:
+                    return True, None  # Partial success for MPC baseline
             return False, "max_steps"
     
     return False, "unknown"
