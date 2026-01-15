@@ -194,7 +194,7 @@ class RFSNStateMachine:
                     # V6: ALL conditions must be met for GRASP → LIFT (enhanced mode)
                     has_bilateral_contact = grasp_quality.get('bilateral_contact', False)
                     is_attached = grasp_quality.get('is_attached', False)
-                    no_slip = not grasp_quality.get('slip_detected', True)
+                    no_slip = not grasp_quality.get('slip_detected', False)
                     contact_persistent = grasp_quality.get('contact_persistent', False)
                     
                     # All conditions must hold
