@@ -742,13 +742,15 @@ class RecedingHorizonMPCQP:
         if not converged:
             # Fallback: use previous solution if available, otherwise zero acceleration
             print(f"[MPC_QP] Warning: QP solver failed with status {reason}")
-            if self.prev_solution is not None and len(self.prev_solution) >= n_states + n_controls:
-                # Extract first control from previous solution (shifted)
-                qdd_cmd_next = self.prev_solution[n_states:n_states + n_controls]
+            # Try to use the second control action from the previous solution, which was planned for the current step
+            if self.prev_solution is not None and len(self.prev_solution) >= 2 * (n_states + n_controls):
+                # u_1 from previous solve corresponds to the action for the current state
+                idx_u_1 = n_states + n_controls + n_states
+                qdd_cmd_next = self.prev_solution[idx_u_1 : idx_u_1 + n_controls]
                 q_ref_next = q + dt * qd
                 qd_ref_next = qd + dt * qdd_cmd_next
             else:
-                # No previous solution: use zero acceleration
+                # No safe previous solution: use zero acceleration
                 q_ref_next = q + dt * qd
                 qd_ref_next = qd
                 qdd_cmd_next = np.zeros(7)
