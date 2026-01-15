@@ -47,6 +47,12 @@ class ObsPacket:
     self_collision: bool = False
     penetration: float = 0.0
     
+    # V10: Contact force signals
+    cube_fingers_fN: float = 0.0  # Normal force magnitude on cube from fingers
+    cube_table_fN: float = 0.0    # Normal force magnitude on cube from table
+    ee_table_fN: float = 0.0      # Normal force magnitude on EE from table
+    force_signal_is_proxy: bool = False  # True if using penetration-based proxy
+    
     # Controller diagnostics
     mpc_converged: bool = True
     mpc_solve_time_ms: float = 0.0
@@ -89,6 +95,10 @@ class ObsPacket:
             'table_collision': self.table_collision,
             'self_collision': self.self_collision,
             'penetration': self.penetration,
+            'cube_fingers_fN': self.cube_fingers_fN,
+            'cube_table_fN': self.cube_table_fN,
+            'ee_table_fN': self.ee_table_fN,
+            'force_signal_is_proxy': self.force_signal_is_proxy,
             'controller_mode': self.controller_mode,
             'mpc_converged': self.mpc_converged,
             'mpc_solve_time_ms': self.mpc_solve_time_ms,

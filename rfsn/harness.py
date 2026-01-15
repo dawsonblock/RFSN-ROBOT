@@ -29,7 +29,7 @@ from rfsn.profiles import ProfileLibrary
 from rfsn.learner import SafeLearner
 from rfsn.safety import SafetyClamp
 from rfsn.logger import RFSNLogger
-from rfsn.mujoco_utils import build_obs_packet, init_id_cache, self_test_contact_parsing
+from rfsn.mujoco_utils import build_obs_packet, init_id_cache, self_test_contact_parsing, GraspValidationConfig
 
 
 class RFSNHarness:
@@ -159,7 +159,7 @@ class RFSNHarness:
         self.mpc_cached_qd_ref = None
         
         if self.mpc_enabled:
-            from rfsn.mpc_receding import RecedingHorizonMPC, MPCConfig
+            from rfsn.mpc_receding import RecedingHorizonMPCQP, MPCConfig
             mpc_config = MPCConfig(
                 H_min=5,
                 H_max=30,
@@ -168,8 +168,9 @@ class RFSNHarness:
                 learning_rate=0.1,
                 warm_start=True
             )
-            self.mpc_solver = RecedingHorizonMPC(mpc_config)
-            print(f"[HARNESS] MPC_TRACKING mode enabled - replanning every {self.mpc_planning_interval} steps")
+            # V10: Use QP-based MPC for predictable runtime
+            self.mpc_solver = RecedingHorizonMPCQP(mpc_config)
+            print(f"[HARNESS] MPC_TRACKING mode enabled (V10 QP solver) - replanning every {self.mpc_planning_interval} steps")
         else:
             print("[HARNESS] ID_SERVO mode (v6 baseline) - using inverse dynamics PD control")
         
@@ -508,6 +509,26 @@ class RFSNHarness:
                     impedance_config = self.impedance_profiles.grasp_soft()
             elif decision.task_mode == "PLACE":
                 impedance_config = self.impedance_profiles.place_gentle()
+                
+                # V10: Force gating during PLACE
+                # Reduce stiffness if contact force exceeds threshold
+                force_gate_threshold = GraspValidationConfig.FORCE_GATE_THRESHOLD
+                if obs.cube_table_fN > force_gate_threshold or obs.ee_table_fN > force_gate_threshold:
+                    # Reduce downward stiffness to prevent excessive force
+                    impedance_config.K_pos[2] = min(impedance_config.K_pos[2], 30.0)
+                    impedance_config.D_pos[2] = min(impedance_config.D_pos[2], 8.0)
+                    
+                    # Log force gate trigger
+                    if self.logger:
+                        self.logger.log_event(
+                            "force_gate_triggered",
+                            {
+                                "cube_table_fN": float(obs.cube_table_fN),
+                                "ee_table_fN": float(obs.ee_table_fN),
+                                "threshold": force_gate_threshold,
+                                "force_signal_is_proxy": obs.force_signal_is_proxy
+                            }
+                        )
             elif decision.task_mode in ["LIFT", "TRANSPORT"]:
                 impedance_config = self.impedance_profiles.transport_stable()
             else:

@@ -12,6 +12,9 @@ from rfsn.obs_packet import ObsPacket
 # Global cache for resolved IDs (initialized once per model)
 _ID_CACHE = None
 
+# Module-level flag to print force proxy warning only once
+_FORCE_PROXY_WARNING_SHOWN = False
+
 
 class GeomBodyIDs:
     """
@@ -127,6 +130,10 @@ class GraspValidationConfig:
     GRIPPER_CLOSED_WIDTH = 0.06  # Gripper width threshold for "closed" (meters)
     LOW_VELOCITY_THRESHOLD = 0.1  # EE velocity threshold for "stable" (m/s)
     LIFT_HEIGHT_THRESHOLD = 0.02  # Minimum lift to confirm attachment (meters)
+    
+    # V10: Force extraction proxy parameters
+    CONTACT_STIFFNESS = 10000.0  # N/m - typical contact stiffness for penetration-based force proxy
+    FORCE_GATE_THRESHOLD = 15.0  # N - force threshold for impedance gating during PLACE
 
 
 def init_id_cache(model: mj.MjModel):
@@ -736,6 +743,166 @@ def check_contact_persistence(history: GraspHistoryBuffer,
     return result
 
 
+def compute_contact_wrenches(model: mj.MjModel, data: mj.MjData, geom_pairs=None) -> dict:
+    """
+    Compute contact forces/wrenches using MuJoCo's proper contact force API.
+    
+    V10 Upgrade: Replaces incorrect efc_force indexing with proper per-contact force extraction.
+    
+    Args:
+        model: MuJoCo model
+        data: MuJoCo data
+        geom_pairs: Optional list of (name1, name2) tuples to track specific pairs
+    
+    Returns:
+        dict with:
+            'contacts': list of per-contact entries with:
+                - geom1_id, geom2_id: geom IDs
+                - dist: signed distance (negative = penetration)
+                - normal: contact normal in world frame (3,)
+                - pos: contact position in world frame (3,)
+                - force_world: contact force in world frame (3,)
+                - torque_world: contact torque in world frame (3,)
+            'cube_fingers_force_world': aggregated force (3,) for cube-finger contacts
+            'cube_table_force_world': aggregated force (3,) for cube-table contacts
+            'ee_table_force_world': aggregated force (3,) for EE-table contacts
+            'force_signal_is_proxy': bool - True if using fallback proxy
+    """
+    # Check if proper API is available
+    has_proper_api = hasattr(mj, 'mj_contactForce')
+    
+    # Get cached IDs for aggregation
+    ids = get_id_cache()
+    
+    # Initialize result
+    result = {
+        'contacts': [],
+        'cube_fingers_force_world': np.zeros(3),
+        'cube_table_force_world': np.zeros(3),
+        'ee_table_force_world': np.zeros(3),
+        'force_signal_is_proxy': not has_proper_api
+    }
+    
+    if not has_proper_api:
+        # Fallback: penetration-based proxy (for gating only)
+        # Print warning only once using a module-level flag
+        global _FORCE_PROXY_WARNING_SHOWN
+        if not _FORCE_PROXY_WARNING_SHOWN:
+            print("[MUJOCO_UTILS] WARNING: mj.mj_contactForce not available, using penetration proxy")
+            _FORCE_PROXY_WARNING_SHOWN = True
+        
+        for i in range(data.ncon):
+            contact = data.contact[i]
+            g1, g2 = contact.geom1, contact.geom2
+            dist = contact.dist
+            
+            # Only count penetration (negative distance)
+            if dist < 0:
+                # Approximate force magnitude from penetration depth
+                # This is a rough proxy: F ≈ stiffness * penetration
+                penetration_depth = abs(dist)
+                approx_force_mag = GraspValidationConfig.CONTACT_STIFFNESS * penetration_depth
+                
+                # Contact normal (world frame)
+                contact_frame = contact.frame.reshape(3, 3)
+                normal = contact_frame[:, 0]  # First column is normal
+                
+                # Force along normal (compressive)
+                force = approx_force_mag * normal
+                
+                # Contact position
+                pos = contact.pos.copy()
+                
+                # Store contact info
+                result['contacts'].append({
+                    'geom1_id': g1,
+                    'geom2_id': g2,
+                    'dist': dist,
+                    'normal': normal.copy(),
+                    'pos': pos,
+                    'force_world': force,
+                    'torque_world': np.zeros(3)  # Not computed in proxy
+                })
+                
+                # Aggregate by geom pairs
+                # Cube-fingers
+                finger_geoms = {ids.left_finger_id, ids.right_finger_id, ids.hand_geom_id}
+                if (g1 == ids.cube_geom_id and g2 in finger_geoms) or \
+                   (g2 == ids.cube_geom_id and g1 in finger_geoms):
+                    result['cube_fingers_force_world'] += force
+                
+                # Cube-table
+                if (g1 == ids.cube_geom_id and g2 == ids.table_geom_id) or \
+                   (g2 == ids.cube_geom_id and g1 == ids.table_geom_id):
+                    result['cube_table_force_world'] += force
+                
+                # EE-table
+                # Allocate array for contact force (6D: force + torque in contact frame)
+                c_array = np.zeros(6, dtype=np.float64)
+                    result['ee_table_force_world'] += force
+        
+        return result
+    
+    # Proper implementation using mj.mj_contactForce
+    # Allocate array for contact force (6D: force + torque in contact frame)
+    c_array = np.zeros(6)
+    
+    for i in range(data.ncon):
+        contact = data.contact[i]
+        g1, g2 = contact.geom1, contact.geom2
+        dist = contact.dist
+        
+        # Extract contact force using proper API
+        # mj_contactForce populates c_array with [normal_force, tangent1, tangent2, 0, 0, 0]
+        # in the contact frame
+        mj.mj_contactForce(model, data, i, c_array)
+        
+        # Get contact frame (columns are: normal, tangent1, tangent2)
+        contact_frame = contact.frame.reshape(3, 3)
+        normal = contact_frame[:, 0]
+        tangent1 = contact_frame[:, 1]
+        tangent2 = contact_frame[:, 2]
+        
+        # Transform force from contact frame to world frame
+        # c_array[0] = normal force, c_array[1] = tangent1 force, c_array[2] = tangent2 force
+        force_world = (c_array[0] * normal + 
+                      c_array[1] * tangent1 + 
+                      c_array[2] * tangent2)
+        
+        # Contact position
+        pos = contact.pos.copy()
+        
+        # Store contact info
+        result['contacts'].append({
+            'geom1_id': g1,
+            'geom2_id': g2,
+            'dist': dist,
+            'normal': normal.copy(),
+            'pos': pos,
+            'force_world': force_world.copy(),
+            'torque_world': np.zeros(3)  # Could compute r × F if needed
+        })
+        
+        # Aggregate by geom pairs
+        # Cube-fingers
+        finger_geoms = {ids.left_finger_id, ids.right_finger_id, ids.hand_geom_id}
+        if (g1 == ids.cube_geom_id and g2 in finger_geoms) or \
+           (g2 == ids.cube_geom_id and g1 in finger_geoms):
+            result['cube_fingers_force_world'] += force_world
+        
+        # Cube-table
+        if (g1 == ids.cube_geom_id and g2 == ids.table_geom_id) or \
+           (g2 == ids.cube_geom_id and g1 == ids.table_geom_id):
+            result['cube_table_force_world'] += force_world
+        
+        # EE-table
+        if (g1 == ids.table_geom_id and g2 in finger_geoms) or \
+           (g2 == ids.table_geom_id and g1 in finger_geoms):
+            result['ee_table_force_world'] += force_world
+    
+    return result
+
+
 def build_obs_packet(
     model: mj.MjModel,
     data: mj.MjData,
@@ -750,6 +917,8 @@ def build_obs_packet(
     """
     Build complete ObsPacket from MuJoCo state.
     
+    V10 Upgrade: Now includes proper contact force signals.
+    
     Args:
         model: MuJoCo model
         data: MuJoCo data
@@ -762,7 +931,7 @@ def build_obs_packet(
         task_name: Task name
         
     Returns:
-        ObsPacket
+        ObsPacket with force signals
     """
     # Joint state
     q = data.qpos[:7].copy()
@@ -778,8 +947,17 @@ def build_obs_packet(
     obj_pos, obj_quat = get_object_pose(model, data, "cube")
     obj_lin_vel, obj_ang_vel = get_object_velocity(model, data, "cube")
     
-    # Contacts
+    # Contacts (legacy boolean flags)
     contacts = check_contacts(model, data)
+    
+    # V10: Compute contact wrenches with proper force extraction
+    contact_wrenches = compute_contact_wrenches(model, data)
+    
+    # Extract normal force magnitudes for gating
+    cube_fingers_fN = np.linalg.norm(contact_wrenches['cube_fingers_force_world'])
+    cube_table_fN = np.linalg.norm(contact_wrenches['cube_table_force_world'])
+    ee_table_fN = np.linalg.norm(contact_wrenches['ee_table_force_world'])
+    force_signal_is_proxy = contact_wrenches['force_signal_is_proxy']
     
     # Joint limits
     joint_limit_prox = compute_joint_limit_proximity(model, data)
@@ -805,6 +983,11 @@ def build_obs_packet(
         table_collision=contacts['table_collision'],
         self_collision=contacts['self_collision'],
         penetration=contacts['penetration'],
+        # V10: Force signals
+        cube_fingers_fN=cube_fingers_fN,
+        cube_table_fN=cube_table_fN,
+        ee_table_fN=ee_table_fN,
+        force_signal_is_proxy=force_signal_is_proxy,
         mpc_converged=mpc_converged,
         mpc_solve_time_ms=mpc_solve_time_ms,
         torque_sat_count=torque_sat_count,

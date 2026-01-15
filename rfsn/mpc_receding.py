@@ -1,7 +1,7 @@
 """
 Receding Horizon MPC for Joint-Space Tracking
 ==============================================
-Real MPC optimizer with warm-start, time budget, and safe fallback.
+V10 Upgrade: Real-time QP-based MPC with OSQP solver.
 
 This module implements a receding-horizon Model Predictive Controller that:
 - Solves a finite-horizon optimization problem at each timestep
@@ -11,12 +11,27 @@ This module implements a receding-horizon Model Predictive Controller that:
 
 The MPC fields (horizon_steps, Q_diag, R_diag, terminal_Q_diag, du_penalty) 
 from RFSN profiles now directly control the optimization behavior.
+
+V10 Changes:
+- Replaced finite-diff gradient descent with QP formulation
+- Uses OSQP for efficient, predictable solve times
+- Proper warm-starting with shifted solutions
+- Analytic cost computation without numerical derivatives
 """
 
 import numpy as np
 import time
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
+
+# Try to import OSQP for QP-based MPC
+try:
+    import osqp
+    from scipy import sparse
+    OSQP_AVAILABLE = True
+except ImportError:
+    OSQP_AVAILABLE = False
+    # Warning will be printed when QP MPC is instantiated, not at import time
 
 
 @dataclass
@@ -482,3 +497,332 @@ class RecedingHorizonMPC:
         """Reset warm-start buffer (e.g., at episode start)."""
         self.prev_qdd_trajectory = None
         self.prev_horizon = None
+
+
+class RecedingHorizonMPCQP:
+    """
+    V10: QP-based Receding Horizon MPC using OSQP.
+    
+    Replaces finite-difference gradient descent with proper QP formulation.
+    
+    Dynamics Model (discrete-time):
+        x = [q(7), qd(7)]  # State: joint positions and velocities (14,)
+        u = qdd(7)         # Control: joint accelerations
+        
+        q_{t+1} = q_t + dt * qd_t
+        qd_{t+1} = qd_t + dt * qdd_t
+        
+        In matrix form:
+        x_{t+1} = A x_t + B u_t
+        where A = [I, dt*I; 0, I], B = [0; dt*I]
+    
+    Cost Function (Quadratic):
+        J = Σ_{t=0}^{H-1} [
+            (q_t - q_target)^T Q_pos (q_t - q_target)      # Position tracking
+            + qd_t^T Q_vel qd_t                             # Velocity penalty
+            + u_t^T R u_t                                   # Effort penalty
+            + (u_t - u_{t-1})^T R_du (u_t - u_{t-1})       # Smoothness
+        ] + (q_H - q_target)^T Q_terminal (q_H - q_target) # Terminal cost
+    
+    This is a standard convex QP:
+        minimize    (1/2) z^T P z + q^T z
+        subject to  l <= A z <= u
+    
+    where z = [x_0, u_0, x_1, u_1, ..., x_H] is the decision variable vector.
+    """
+    
+    def __init__(self, config: Optional[MPCConfig] = None):
+        """
+        Initialize QP-based MPC solver.
+        
+        Args:
+            config: MPC configuration (uses defaults if None)
+        """
+        self.config = config or MPCConfig()
+        
+        # Print warning once if OSQP not available
+        if not OSQP_AVAILABLE:
+            print("[MPC_QP] WARNING: OSQP not available, will fall back to gradient-based MPC")
+        
+        # OSQP solver instance (created per horizon)
+        self.solver = None
+        self.prev_horizon = None
+        self.prev_solution = None  # For warm-starting
+        
+    def solve(
+        self,
+        q: np.ndarray,
+        qd: np.ndarray,
+        q_target: np.ndarray,
+        dt: float,
+        decision_params: dict,
+        joint_limits: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    ) -> MPCResult:
+        """
+        Solve MPC optimization using QP formulation.
+        
+        Args:
+            q: Current joint positions (7,)
+            qd: Current joint velocities (7,)
+            q_target: Target joint positions (7,)
+            dt: Timestep
+            decision_params: Dictionary with MPC parameters from RFSN decision:
+                - horizon_steps: int
+                - Q_diag: np.ndarray (14,) [position (7), velocity (7)]
+                - R_diag: np.ndarray (7,)
+                - terminal_Q_diag: np.ndarray (14,)
+                - du_penalty: float
+            joint_limits: Optional (q_min, q_max) tuple for bounds checking
+        
+        Returns:
+            MPCResult with optimized trajectory and metrics
+        """
+        if not OSQP_AVAILABLE:
+            # Fallback to gradient-based MPC
+            fallback_mpc = RecedingHorizonMPC(self.config)
+            return fallback_mpc.solve(q, qd, q_target, dt, decision_params, joint_limits)
+        
+        t_start = time.perf_counter()
+        
+        # Extract parameters
+        H = np.clip(decision_params['horizon_steps'], self.config.H_min, self.config.H_max)
+        Q_pos = decision_params['Q_diag'][:7]  # Position tracking weights
+        Q_vel = decision_params['Q_diag'][7:14]  # Velocity penalty weights
+        R = decision_params['R_diag']  # Effort weights
+        Q_terminal_pos = decision_params['terminal_Q_diag'][:7]
+        du_penalty = decision_params['du_penalty']
+        
+        # Build QP matrices
+        # Decision variable: z = [x_0, u_0, x_1, u_1, ..., x_{H-1}, u_{H-1}, x_H]
+        # State x_t = [q_t (7), qd_t (7)] (14,)
+        # Control u_t = qdd_t (7,)
+        # Total decision variables: (H+1) states + H controls = (H+1)*14 + H*7 = 21*H + 14
+        
+        n_states = 14  # [q, qd]
+        n_controls = 7  # [qdd]
+        n_z = (H + 1) * n_states + H * n_controls  # Total decision variables
+        
+        # Initial state
+        x0 = np.concatenate([q, qd])
+        
+        # Build dynamics constraints: x_{t+1} = A x_t + B u_t
+        A_dyn = np.eye(n_states)
+        A_dyn[:7, 7:] = dt * np.eye(7)  # q_{t+1} = q_t + dt * qd_t
+        B_dyn = np.zeros((n_states, n_controls))
+        B_dyn[7:, :] = dt * np.eye(7)  # qd_{t+1} = qd_t + dt * qdd_t
+        
+        # Cost matrix P (quadratic term)
+        P = sparse.lil_matrix((n_z, n_z))
+        q_vec = np.zeros(n_z)
+        
+        # Add stage costs
+        for t in range(H):
+            idx_x = t * (n_states + n_controls)
+            idx_u = idx_x + n_states
+            
+            # Position tracking cost: (q_t - q_target)^T Q_pos (q_t - q_target)
+            # This contributes Q_pos to P[idx_q, idx_q] and -Q_pos * q_target to q_vec
+            for i in range(7):
+                P[idx_x + i, idx_x + i] = Q_pos[i]
+                q_vec[idx_x + i] = -Q_pos[i] * q_target[i]
+            
+            # Velocity cost: qd_t^T Q_vel qd_t
+            for i in range(7):
+                P[idx_x + 7 + i, idx_x + 7 + i] = Q_vel[i]
+            
+            # Control effort cost: u_t^T R u_t
+            for i in range(7):
+                P[idx_u + i, idx_u + i] = R[i]
+            
+            # Smoothness cost: (u_t - u_{t-1})^T R_du (u_t - u_{t-1})
+            # Note: Using scalar du_penalty uniformly across all joints.
+            # Future enhancement: Consider per-joint du_penalty vector for more flexible tuning.
+            if t > 0:
+                idx_u_prev = (t - 1) * (n_states + n_controls) + n_states
+                for i in range(7):
+                    P[idx_u + i, idx_u + i] += du_penalty
+                    P[idx_u_prev + i, idx_u_prev + i] += du_penalty
+                    P[idx_u + i, idx_u_prev + i] = -du_penalty
+                    P[idx_u_prev + i, idx_u + i] = -du_penalty
+        
+        # Terminal cost: (q_H - q_target)^T Q_terminal (q_H - q_target)
+        idx_x_H = H * (n_states + n_controls)
+        for i in range(7):
+            P[idx_x_H + i, idx_x_H + i] = Q_terminal_pos[i]
+            q_vec[idx_x_H + i] = -Q_terminal_pos[i] * q_target[i]
+        
+        # Convert to CSC format for OSQP
+        P = P.tocsc()
+        
+        # Build constraint matrix A and bounds l, u
+        # Constraints:
+        # 1. Initial state: x_0 = [q, qd]
+        # 2. Dynamics: x_{t+1} = A x_t + B u_t for t = 0, ..., H-1
+        # 3. Control bounds: u_min <= u_t <= u_max
+        
+        n_constraints = n_states + H * n_states  # Initial + dynamics
+        A_constraint = sparse.lil_matrix((n_constraints, n_z))
+        l_constraint = np.zeros(n_constraints)
+        u_constraint = np.zeros(n_constraints)
+        
+        # Initial state constraint: x_0 = [q, qd]
+        for i in range(n_states):
+            A_constraint[i, i] = 1.0
+            l_constraint[i] = x0[i]
+            u_constraint[i] = x0[i]
+        
+        # Dynamics constraints: x_{t+1} = A x_t + B u_t
+        # Rewrite as: -x_{t+1} + A x_t + B u_t = 0
+        for t in range(H):
+            idx_x_t = t * (n_states + n_controls)
+            idx_u_t = idx_x_t + n_states
+            idx_x_tp1 = idx_u_t + n_controls
+            
+            constraint_row_start = n_states + t * n_states
+            
+            # For each state dimension
+            for i in range(n_states):
+                row_idx = constraint_row_start + i
+                
+                # -x_{t+1}[i]
+                A_constraint[row_idx, idx_x_tp1 + i] = -1.0
+                
+                # A x_t: A[i, :] . x_t
+                for j in range(n_states):
+                    A_constraint[row_idx, idx_x_t + j] = A_dyn[i, j]
+                
+                # B u_t: B[i, :] . u_t
+                for j in range(n_controls):
+                    A_constraint[row_idx, idx_u_t + j] = B_dyn[i, j]
+                
+                # Equality constraint: = 0
+                l_constraint[row_idx] = 0.0
+                u_constraint[row_idx] = 0.0
+        
+        # Control bounds (as simple bounds within OSQP)
+        # We'll add these as explicit constraint rows in the A matrix
+        n_bound_constraints = H * n_controls
+        A_full = sparse.lil_matrix((n_constraints + n_bound_constraints, n_z))
+        A_full[:n_constraints, :] = A_constraint
+        
+        # Add bound constraints: u_t rows (identity constraints for control variables)
+        for t in range(H):
+            idx_u = t * (n_states + n_controls) + n_states
+            constraint_idx = n_constraints + t * n_controls
+            for i in range(n_controls):
+                A_full[constraint_idx + i, idx_u + i] = 1.0
+        
+        A_full = A_full.tocsc()
+        
+        l_full = np.concatenate([l_constraint, np.tile(self.config.qdd_min, H)])
+        u_full = np.concatenate([u_constraint, np.tile(self.config.qdd_max, H)])
+        
+        # Setup OSQP problem
+        # Create new solver or update existing one if horizon unchanged
+        if self.solver is None or self.prev_horizon != H:
+            self.solver = osqp.OSQP()
+            self.solver.setup(
+                P=P, q=q_vec, A=A_full, l=l_full, u=u_full,
+                verbose=False,
+                eps_abs=1e-4,
+                eps_rel=1e-4,
+                max_iter=self.config.max_iterations,
+                time_limit=self.config.time_budget_ms / 1000.0
+            # Warm start if available
+            if self.config.warm_start and self.prev_solution is not None and len(self.prev_solution) == n_z:
+                # Shift previous solution for a better warm start
+                warm_start_sol = np.zeros(n_z)
+    
+                # Shift states and controls
+                for t in range(H):
+                    # old x_{t+1} -> new x_t
+                    old_idx_x_tp1 = (t + 1) * (n_states + n_controls)
+                    new_idx_x_t = t * (n_states + n_controls)
+                    warm_start_sol[new_idx_x_t : new_idx_x_t + n_states] = self.prev_solution[old_idx_x_tp1 : old_idx_x_tp1 + n_states]
+        
+                    if t < H - 1:
+                        # old u_{t+1} -> new u_t
+                        old_idx_u_tp1 = old_idx_x_tp1 + n_states
+                        new_idx_u_t = new_idx_x_t + n_states
+                        warm_start_sol[new_idx_u_t : new_idx_u_t + n_controls] = self.prev_solution[old_idx_u_tp1 : old_idx_u_tp1 + n_controls]
+
+                # Last state is a copy of the second to last
+                warm_start_sol[H * (n_states + n_controls) : ] = warm_start_sol[(H-1) * (n_states + n_controls) : (H-1) * (n_states + n_controls) + n_states]
+
+                self.solver.warm_start(x=warm_start_sol)
+            # Update cost and constraint matrices when parameters change
+            self.solver.update(Px=P.data, q=q_vec, l=l_full, u=u_full)
+        
+        # Warm start if available
+        if self.prev_solution is not None and len(self.prev_solution) == n_z:
+            self.solver.warm_start(x=self.prev_solution)
+        
+        # Solve
+        result = self.solver.solve()
+        
+        # Check solution status
+        converged = result.info.status == 'solved'
+        reason = result.info.status
+        
+        if not converged:
+            # Fallback: use previous solution if available, otherwise zero acceleration
+            print(f"[MPC_QP] Warning: QP solver failed with status {reason}")
+            # Try to use the second control action from the previous solution, which was planned for the current step
+            if self.prev_solution is not None and len(self.prev_solution) >= 2 * (n_states + n_controls):
+                # u_1 from previous solve corresponds to the action for the current state
+                idx_u_1 = n_states + n_controls + n_states
+                qdd_cmd_next = self.prev_solution[idx_u_1 : idx_u_1 + n_controls]
+                q_ref_next = q + dt * qd
+                qd_ref_next = qd + dt * qdd_cmd_next
+            else:
+                # No safe previous solution: use zero acceleration
+                q_ref_next = q + dt * qd
+                qd_ref_next = qd
+                qdd_cmd_next = np.zeros(7)
+            
+            solve_time_ms = (time.perf_counter() - t_start) * 1000.0
+            
+            return MPCResult(
+                converged=False,
+                solve_time_ms=solve_time_ms,
+                iters=result.info.iter if hasattr(result.info, 'iter') else 0,
+                reason=f"qp_failed_{reason}",
+                cost_total=float('inf'),
+                q_ref_next=q_ref_next,
+                qd_ref_next=qd_ref_next,
+                qdd_cmd_next=qdd_cmd_next
+            )
+        
+        # Extract solution
+        z_opt = result.x
+        self.prev_solution = z_opt  # Store for warm-start
+        
+        # Extract first control and next state
+        idx_u_0 = n_states
+        idx_x_1 = n_states + n_controls
+        
+        qdd_cmd_next = z_opt[idx_u_0:idx_u_0 + n_controls]
+        q_ref_next = z_opt[idx_x_1:idx_x_1 + 7]
+        qd_ref_next = z_opt[idx_x_1 + 7:idx_x_1 + n_states]
+        
+        # Compute final cost
+        cost_total = result.info.obj_val
+        
+        solve_time_ms = (time.perf_counter() - t_start) * 1000.0
+        
+        return MPCResult(
+            converged=True,
+            solve_time_ms=solve_time_ms,
+            iters=result.info.iter,
+            reason="converged",
+            cost_total=cost_total,
+            q_ref_next=q_ref_next,
+            qd_ref_next=qd_ref_next,
+            qdd_cmd_next=qdd_cmd_next
+        )
+    
+    def reset_warm_start(self):
+        """Reset warm-start buffer."""
+        self.prev_solution = None
+        self.prev_horizon = None
+        self.solver = None
