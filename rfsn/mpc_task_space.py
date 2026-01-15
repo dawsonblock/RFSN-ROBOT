@@ -372,10 +372,18 @@ class TaskSpaceRecedingHorizonMPC:
             qd_traj[t + 1, :] = qd_traj[t, :] + dt * qdd_trajectory[t, :]
             q_traj[t + 1, :] = q_traj[t, :] + dt * qd_traj[t + 1, :]
             
-            # Clamp to joint limits
-            for i in range(7):
-                q_min = self.model.jnt_range[i, 0]
-                q_max = self.model.jnt_range[i, 1]
+            # Clamp to joint limits (match qpos indices 0..6)
+            if not hasattr(self, "_arm_joint_ids"):
+                self._arm_joint_ids = []
+                for j in range(self.model.njnt):
+                    adr = int(self.model.jnt_qposadr[j])
+                    if 0 <= adr < 7:
+                        self._arm_joint_ids.append(j)
+                self._arm_joint_ids = sorted(self._arm_joint_ids, key=lambda j: int(self.model.jnt_qposadr[j]))
+
+            for i, jnt_id in enumerate(self._arm_joint_ids[:7]):
+                q_min = self.model.jnt_range[jnt_id, 0]
+                q_max = self.model.jnt_range[jnt_id, 1]
                 q_traj[t + 1, i] = np.clip(q_traj[t + 1, i], q_min, q_max)
             
             # Forward kinematics
