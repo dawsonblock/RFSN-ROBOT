@@ -29,7 +29,7 @@ from rfsn.profiles import ProfileLibrary
 from rfsn.learner import SafeLearner
 from rfsn.safety import SafetyClamp
 from rfsn.logger import RFSNLogger
-from rfsn.mujoco_utils import build_obs_packet
+from rfsn.mujoco_utils import build_obs_packet, init_id_cache, self_test_contact_parsing
 
 
 class RFSNHarness:
@@ -97,6 +97,15 @@ class RFSNHarness:
         self.dt = model.opt.timestep
         self.t = 0.0
         self.step_count = 0
+        
+        # Initialize geom/body ID cache (fail-loud on missing IDs)
+        print("[HARNESS] Initializing fail-loud ID cache...")
+        init_id_cache(model)
+        
+        # Run self-test to validate contact parsing
+        print("[HARNESS] Running contact parsing self-test...")
+        self_test_contact_parsing(model, data)
+        print("[HARNESS] Initialization complete - safety signals validated")
         
         # PD gains for baseline MPC
         self.KP = np.array([300.0, 300.0, 300.0, 300.0, 150.0, 100.0, 50.0])
@@ -185,8 +194,8 @@ class RFSNHarness:
             # Apply safety clamps
             decision = self.safety_clamp.apply(decision, obs)
             
-            # Convert EE target to joint target (IK stub)
-            q_target = self._ee_target_to_joint_target(decision)
+            # Convert EE target to joint target (IK with contact-dependent weighting)
+            q_target = self._ee_target_to_joint_target(decision, obs=obs)
         else:
             # Baseline MPC mode: fixed joint target
             decision = None
@@ -262,7 +271,7 @@ class RFSNHarness:
         return obs
     
     def end_episode(self, success: bool = False, failure_reason: str = None):
-        """End current episode and update learning with safety coupling."""
+        """End current episode and update learning with correct attribution."""
         self.episode_active = False
         
         # Update learner if enabled
@@ -272,55 +281,117 @@ class RFSNHarness:
                 self.decision_history
             )
             
-            # Track which (state, profile) pairs were used and count severe events per pair
-            state_profile_usage = {}  # (state, profile) -> {'count': int, 'severe_events': int}
+            # V5: Track (state, profile) usage with time-windowed attribution
+            # Attribution: Profile must be active for at least K steps or event within N steps of switch
+            MIN_ACTIVE_STEPS = 5  # Profile must be active this long to be attributed
+            SWITCH_WINDOW_STEPS = 3  # Or event within this many steps of switching to profile
+            
+            state_profile_usage = {}  # (state, profile) -> usage info
+            
+            # Track when each (state, profile) became active
+            current_state_profile = None
+            active_since_step = 0
             
             for i, decision in enumerate(self.decision_history):
                 # Extract profile name from rollback token
-                profile_name = decision.rollback_token.split('_')[1] if '_' in decision.rollback_token else 'base'
+                profile_name = 'base'
+                if hasattr(decision, 'rollback_token') and decision.rollback_token:
+                    if '_' in decision.rollback_token:
+                        parts = decision.rollback_token.split('_')
+                        if len(parts) >= 2:
+                            profile_name = parts[1]
+                
                 key = (decision.task_mode, profile_name)
                 
+                # Detect state/profile switch
+                if current_state_profile != key:
+                    current_state_profile = key
+                    active_since_step = i
+                
+                # Initialize usage tracking
                 if key not in state_profile_usage:
-                    state_profile_usage[key] = {'count': 0, 'severe_events': 0}
+                    state_profile_usage[key] = {
+                        'count': 0,
+                        'severe_events': 0,
+                        'attributed_severe_events': 0,  # Only attributed events
+                    }
                 
                 state_profile_usage[key]['count'] += 1
                 
-                # Count severe events at this step
+                # Check for severe events at this step
                 if i < len(self.obs_history):
                     obs = self.obs_history[i]
-                    if (obs.self_collision or obs.table_collision or 
-                        obs.penetration > 0.05 or obs.torque_sat_count >= 5):
+                    is_severe = (obs.self_collision or obs.table_collision or 
+                                obs.penetration > 0.05 or obs.torque_sat_count >= 5)
+                    
+                    if is_severe:
                         state_profile_usage[key]['severe_events'] += 1
+                        
+                        # V5: Only attribute if profile was active long enough OR within switch window
+                        steps_active = i - active_since_step
+                        if steps_active >= MIN_ACTIVE_STEPS or steps_active <= SWITCH_WINDOW_STEPS:
+                            state_profile_usage[key]['attributed_severe_events'] += 1
+                            
+                            # Log attribution event
+                            if self.logger:
+                                self.logger._log_event('severe_event_attributed', obs.t, {
+                                    'state': decision.task_mode,
+                                    'profile': profile_name,
+                                    'steps_active': steps_active,
+                                    'reason': 'sufficient_activity' if steps_active >= MIN_ACTIVE_STEPS else 'switch_window'
+                                })
             
-            # Update stats and poison profiles with repeated severe events
+            # Update stats and check for poisoning/rollback
             for (state, profile), usage_info in state_profile_usage.items():
-                # Update learner statistics
+                # Update learner statistics with attributed events
                 profile_score = score / len(state_profile_usage)  # Distribute score
-                profile_violations = usage_info['severe_events']
+                profile_violations = usage_info['attributed_severe_events']
                 
                 self.learner.update_stats(state, profile, profile_score, profile_violations, self.t)
                 
-                # Check if this profile should be poisoned (2+ severe events in last 5 uses)
+                # V5: Check if profile should be poisoned (stricter criteria)
+                # Poison if: 2+ attributed severe events in last 5 uses
                 stats = self.learner.stats.get((state, profile))
-                if stats and stats.N >= 5 and hasattr(stats, 'recent_scores') and len(stats.recent_scores) >= 5:
+                if stats and stats.N >= 5:
                     recent_severe_count = sum(1 for s in stats.recent_scores[-5:] if s < -5.0)
                     if recent_severe_count >= 2:
-                        # Poison this profile to prevent future selection
+                        # Poison this profile and trigger rollback
                         self.safety_clamp.poison_profile(state, profile)
-                        print(f"[HARNESS] Poisoned ({state}, {profile}) due to repeated severe events")
+                        rollback_profile = self.learner.trigger_rollback(state, profile)
+                        
+                        # Log rollback event
+                        if self.logger:
+                            self.logger._log_event('profile_rollback', self.t, {
+                                'state': state,
+                                'bad_profile': profile,
+                                'rollback_to': rollback_profile,
+                                'reason': f'repeated_severe_events_in_window',
+                                'recent_severe_count': recent_severe_count,
+                            })
+                        
+                        print(f"[HARNESS] Poisoned and rolled back ({state}, {profile}) → {rollback_profile}")
+
 
         
         if self.logger:
             self.logger.end_episode(success, failure_reason)
 
     
-    def _ee_target_to_joint_target(self, decision: RFSNDecision, use_orientation: bool = None) -> np.ndarray:
+    def _ee_target_to_joint_target(self, decision: RFSNDecision, use_orientation: bool = None, 
+                                   obs: ObsPacket = None) -> np.ndarray:
         """
         Convert end-effector target to joint target using damped least squares IK.
+        
+        V5 HARDENING:
+        - State and contact-dependent orientation weighting
+        - Clamped orientation error and dq step magnitude
+        - Stall detector for early termination
+        - Reuses live data (no allocation in tight loop)
         
         Args:
             decision: Decision containing target pose and horizon_steps
             use_orientation: If True, include orientation in IK. If None, auto-decide based on state.
+            obs: Current observation (for contact-dependent weighting)
         
         Uses MuJoCo Jacobian and iterative pose-based (position + orientation) IK with damping.
         Orientation is soft-weighted and optional per state for stability.
@@ -328,10 +399,13 @@ class RFSNHarness:
         PROXY MAPPING: decision.horizon_steps → IK max_iterations
         Higher horizon → more IK iterations → finer convergence (but slower)
         """
+        from rfsn.mujoco_utils import get_id_cache
+        
         q_current = self.data.qpos[:7].copy()
         
-        # Get end-effector body ID
-        ee_body_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, "panda_hand")
+        # Get end-effector body ID from cache
+        ids = get_id_cache()
+        ee_body_id = ids.ee_body_id
         
         # Decide whether to use orientation based on state (if not explicitly specified)
         if use_orientation is None:
@@ -351,12 +425,31 @@ class RFSNHarness:
         pos_tolerance = 0.01  # 1cm
         ori_tolerance = 0.1   # Quaternion distance tolerance
         
-        # Orientation weight (soft constraint)
-        ori_weight = 0.3  # Lower weight than position (soft orientation)
+        # V5: Contact-dependent orientation weight
+        # Reduce orientation weight if in contact to prevent oscillation
+        base_ori_weight = 0.3  # Lower weight than position (soft orientation)
+        if obs and (obs.ee_contact or obs.obj_contact):
+            # Reduce orientation weight during contact
+            ori_weight = base_ori_weight * 0.3  # 70% reduction
+        elif decision.task_mode in ["GRASP", "PLACE"]:
+            # Allow moderate orientation weight for grasp/place when not in contact
+            ori_weight = base_ori_weight
+        else:
+            # Low orientation weight for other states
+            ori_weight = base_ori_weight * 0.5
+        
+        # V5: Stall detection
+        best_error = float('inf')
+        stall_count = 0
+        max_stall_iterations = 3  # Stop if no improvement for 3 iterations
+        
+        # Reuse a single temp data for all iterations (no allocation in loop)
+        if not hasattr(self, '_ik_temp_data'):
+            self._ik_temp_data = mj.MjData(self.model)
+        data_temp = self._ik_temp_data
         
         for iteration in range(max_iterations):
-            # Update MuJoCo data with current joint positions
-            data_temp = mj.MjData(self.model)
+            # Update temp data with current joint positions
             data_temp.qpos[:] = self.data.qpos
             data_temp.qpos[:7] = q_ik
             mj.mj_forward(self.model, data_temp)
@@ -372,6 +465,24 @@ class RFSNHarness:
             ori_error = np.zeros(3)
             if use_orientation:
                 ori_error = self._quaternion_error(ee_quat_current, decision.x_target_quat)
+                # V5: Clamp orientation error magnitude to prevent large corrections
+                max_ori_error = 0.3  # ~17 degrees max
+                ori_error_norm = np.linalg.norm(ori_error)
+                if ori_error_norm > max_ori_error:
+                    ori_error = ori_error * (max_ori_error / ori_error_norm)
+            
+            # Compute total error for stall detection
+            total_error = np.linalg.norm(pos_error) + np.linalg.norm(ori_error)
+            
+            # V5: Stall detector - check if error is improving
+            if total_error >= best_error * 0.99:  # No significant improvement (1% threshold)
+                stall_count += 1
+                if stall_count >= max_stall_iterations:
+                    # Stalled, return best-so-far
+                    break
+            else:
+                best_error = total_error
+                stall_count = 0
             
             # Check convergence
             pos_converged = np.linalg.norm(pos_error) < pos_tolerance
@@ -403,6 +514,12 @@ class RFSNHarness:
                 JJT = J_pos @ J_pos.T
                 damping_matrix = damping_pos**2 * np.eye(3)
                 dq = J_pos.T @ np.linalg.solve(JJT + damping_matrix, pos_error)
+            
+            # V5: Clamp dq step magnitude to prevent large jumps
+            max_dq_norm = 0.3  # Max joint change per iteration
+            dq_norm = np.linalg.norm(dq)
+            if dq_norm > max_dq_norm:
+                dq = dq * (max_dq_norm / dq_norm)
             
             # Update joint angles with step size
             q_ik += alpha * dq

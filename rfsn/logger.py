@@ -64,9 +64,17 @@ class RFSNLogger:
                 'energy_proxy',
                 'smoothness_proxy',
                 'final_distance_to_goal',
+                'initial_cube_x',
+                'initial_cube_y',
+                'initial_cube_z',
+                'goal_x',
+                'goal_y',
+                'goal_z',
+                'recover_time_steps',
             ])
     
-    def start_episode(self, episode_id: int, task_name: str):
+    def start_episode(self, episode_id: int, task_name: str, 
+                     initial_cube_pos: list = None, goal_pos: list = None):
         """Start logging a new episode."""
         self.current_episode = {
             'episode_id': episode_id,
@@ -75,11 +83,13 @@ class RFSNLogger:
             'obs_history': [],
             'decision_history': [],
             'events': [],
+            'initial_cube_pos': initial_cube_pos,
+            'goal_pos': goal_pos,
         }
         self.episode_count += 1
     
     def log_step(self, obs: ObsPacket, decision: RFSNDecision):
-        """Log a single control step."""
+        """Log a single control step with (state, profile) tracking."""
         if self.current_episode is None:
             return
         
@@ -89,16 +99,54 @@ class RFSNLogger:
         self.current_episode['obs_history'].append(obs)
         self.current_episode['decision_history'].append(decision)
         
-        # Log events
+        # Extract profile name from rollback token
+        profile_name = 'base'
+        if hasattr(decision, 'rollback_token') and decision.rollback_token:
+            if '_' in decision.rollback_token:
+                parts = decision.rollback_token.split('_')
+                if len(parts) >= 2:
+                    profile_name = parts[1]
+        
+        # Log events with (state, profile) attribution
         if obs.self_collision:
-            self._log_event('self_collision', obs.t, {'state': decision.task_mode})
+            self._log_event('self_collision', obs.t, {
+                'state': decision.task_mode,
+                'profile': profile_name,
+                'severity': 'severe'
+            })
         if obs.table_collision:
-            self._log_event('table_collision', obs.t, {'state': decision.task_mode})
-        if obs.torque_sat_count > 0:
-            self._log_event('torque_saturation', obs.t, 
-                          {'count': obs.torque_sat_count, 'state': decision.task_mode})
+            self._log_event('table_collision', obs.t, {
+                'state': decision.task_mode,
+                'profile': profile_name,
+                'severity': 'severe'
+            })
+        if obs.penetration > 0.05:
+            self._log_event('excessive_penetration', obs.t, {
+                'state': decision.task_mode,
+                'profile': profile_name,
+                'penetration': obs.penetration,
+                'severity': 'severe'
+            })
+        if obs.torque_sat_count >= 5:
+            self._log_event('excessive_torque_saturation', obs.t, {
+                'count': obs.torque_sat_count,
+                'state': decision.task_mode,
+                'profile': profile_name,
+                'severity': 'severe'
+            })
+        elif obs.torque_sat_count > 0:
+            self._log_event('torque_saturation', obs.t, {
+                'count': obs.torque_sat_count,
+                'state': decision.task_mode,
+                'profile': profile_name,
+                'severity': 'minor'
+            })
         if not obs.mpc_converged:
-            self._log_event('mpc_nonconvergence', obs.t, {'state': decision.task_mode})
+            self._log_event('mpc_nonconvergence', obs.t, {
+                'state': decision.task_mode,
+                'profile': profile_name,
+                'severity': 'minor'
+            })
     
     def _log_event(self, event_type: str, time: float, data: dict):
         """Log an event to JSONL."""
@@ -164,6 +212,15 @@ class RFSNLogger:
         else:
             final_distance = 0.0
         
+        # Extract initial cube and goal positions
+        initial_cube_pos = self.current_episode.get('initial_cube_pos')
+        goal_pos = self.current_episode.get('goal_pos')
+        
+        # Count RECOVER time
+        recover_time_steps = 0
+        if decision_history:
+            recover_time_steps = sum(1 for d in decision_history if d.task_mode == 'RECOVER')
+        
         # Write to CSV
         with open(self.episodes_csv_path, 'a', newline='') as f:
             writer = csv.writer(f)
@@ -185,6 +242,13 @@ class RFSNLogger:
                 energy_proxy,
                 smoothness_proxy,
                 final_distance,
+                initial_cube_pos[0] if initial_cube_pos else 0.0,
+                initial_cube_pos[1] if initial_cube_pos else 0.0,
+                initial_cube_pos[2] if initial_cube_pos else 0.0,
+                goal_pos[0] if goal_pos else 0.0,
+                goal_pos[1] if goal_pos else 0.0,
+                goal_pos[2] if goal_pos else 0.0,
+                recover_time_steps,
             ])
         
         # Log episode end event

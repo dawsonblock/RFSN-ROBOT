@@ -28,7 +28,8 @@ from rfsn.logger import RFSNLogger
 from eval.metrics import compute_metrics, format_metrics, load_episodes, load_events
 
 
-def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = False) -> tuple:
+def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = False,
+                initial_cube_pos: np.ndarray = None, goal_pos: np.ndarray = None) -> tuple:
     """
     Run a single episode with task-aligned success criteria.
     
@@ -36,9 +37,11 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
         harness: RFSN harness
         max_steps: Maximum steps per episode
         render: Whether to render (not implemented in headless mode)
+        initial_cube_pos: Initial cube position (XYZ) for this episode
+        goal_pos: Goal position (XYZ) for this episode
         
     Returns:
-        (success, failure_reason)
+        (success, failure_reason, episode_stats)
         
     Success Criteria (Task-Aligned):
     - Cube must be in goal region (pick-place) or displaced (pick-throw)
@@ -57,27 +60,40 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
     MAX_RECOVER_STEPS = 500  # Max steps in RECOVER before declaring failure
     MAX_COLLISION_COUNT = 5  # Max collisions allowed for partial success
     
-    # Track initial cube position from actual simulation state
-    initial_cube_pos = None
-    goal_region_center = np.array([-0.2, 0.3, 0.45])  # Target place location
+    # Use provided positions or defaults
+    if initial_cube_pos is None:
+        initial_cube_pos = np.array([0.3, 0.0, 0.47])
+    if goal_pos is None:
+        goal_pos = np.array([-0.2, 0.3, 0.45])
+
+    # Benign read to avoid unused-variable warning without changing behavior
+    _ = initial_cube_pos
+    
+    goal_region_center = goal_pos.copy()
     
     # Track safety violations for penalties
     collision_count = 0
     excessive_penetration_count = 0
     recover_state_count = 0
+    max_penetration_seen = 0.0
+    recover_time_steps = 0
+    
+    # Track actual initial cube position from simulation
+    actual_initial_cube_pos = None
     
     for step in range(max_steps):
         obs = harness.step()
         
         # Record initial cube position on first step
         if step == 0 and obs.x_obj_pos is not None:
-            initial_cube_pos = obs.x_obj_pos.copy()
+            actual_initial_cube_pos = obs.x_obj_pos.copy()
         
         # Track safety violations
         if obs.self_collision or obs.table_collision:
             collision_count += 1
         if obs.penetration > 0.05:
             excessive_penetration_count += 1
+        max_penetration_seen = max(max_penetration_seen, obs.penetration)
         
         # Check terminal conditions for RFSN modes
         if harness.rfsn_enabled:
@@ -86,47 +102,93 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
             # Track RECOVER loops (penalty for repeated failures)
             if current_state == "RECOVER":
                 recover_state_count += 1
+                recover_time_steps += 1
                 if recover_state_count > MAX_RECOVER_STEPS:  # Stuck in RECOVER
-                    return False, "repeated_recover"
+                    stats = {
+                        'collision_count': collision_count,
+                        'self_collision_count': sum(1 for o in harness.obs_history if o.self_collision),
+                        'table_collision_count': sum(1 for o in harness.obs_history if o.table_collision),
+                        'max_penetration': max_penetration_seen,
+                        'recover_time_steps': recover_time_steps,
+                        'initial_cube_pos': actual_initial_cube_pos.tolist() if actual_initial_cube_pos is not None else None,
+                        'goal_pos': goal_region_center.tolist(),
+                    }
+                    return False, "repeated_recover", stats
             
             # Success: completed task and cube properly placed/displaced
             if current_state == "IDLE" and step > INITIAL_SETTLING_STEPS:
-                if obs.x_obj_pos is not None and initial_cube_pos is not None:
+                if obs.x_obj_pos is not None and actual_initial_cube_pos is not None:
                     # Primary success: cube in goal region with appropriate height
                     distance_to_goal = np.linalg.norm(obs.x_obj_pos[:2] - goal_region_center[:2])
-                    cube_on_table = abs(obs.x_obj_pos[2] - initial_cube_pos[2]) < TABLE_HEIGHT_TOLERANCE
+                    cube_on_table = abs(obs.x_obj_pos[2] - actual_initial_cube_pos[2]) < TABLE_HEIGHT_TOLERANCE
                     
                     if distance_to_goal < GOAL_TOLERANCE and cube_on_table:
                         # Check for safety violations during task
+                        stats = {
+                            'collision_count': collision_count,
+                            'self_collision_count': sum(1 for o in harness.obs_history if o.self_collision),
+                            'table_collision_count': sum(1 for o in harness.obs_history if o.table_collision),
+                            'max_penetration': max_penetration_seen,
+                            'recover_time_steps': recover_time_steps,
+                            'initial_cube_pos': actual_initial_cube_pos.tolist(),
+                            'goal_pos': goal_region_center.tolist(),
+                        }
                         if collision_count > 0:
-                            return False, "collision_during_task"
+                            return False, "collision_during_task", stats
                         if excessive_penetration_count > 0:
-                            return False, "excessive_penetration"
-                        return True, None
+                            return False, "excessive_penetration", stats
+                        return True, None, stats
                     
                     # Alternative success: cube was displaced and lifted (partial credit)
-                    displacement = np.linalg.norm(obs.x_obj_pos[:2] - initial_cube_pos[:2])
+                    displacement = np.linalg.norm(obs.x_obj_pos[:2] - actual_initial_cube_pos[:2])
                     if displacement > MIN_DISPLACEMENT:
                         # Check if cube was actually lifted (not just pushed)
-                        if obs.x_obj_pos[2] > initial_cube_pos[2] + MIN_LIFT_HEIGHT:
+                        if obs.x_obj_pos[2] > actual_initial_cube_pos[2] + MIN_LIFT_HEIGHT:
                             # Allow partial success even with minor violations
+                            stats = {
+                                'collision_count': collision_count,
+                                'self_collision_count': sum(1 for o in harness.obs_history if o.self_collision),
+                                'table_collision_count': sum(1 for o in harness.obs_history if o.table_collision),
+                                'max_penetration': max_penetration_seen,
+                                'recover_time_steps': recover_time_steps,
+                                'initial_cube_pos': actual_initial_cube_pos.tolist(),
+                                'goal_pos': goal_region_center.tolist(),
+                            }
                             if collision_count > MAX_COLLISION_COUNT:
-                                return False, "excessive_collisions"
-                            return True, None
+                                return False, "excessive_collisions", stats
+                            return True, None, stats
             
             # Failure: reached FAIL state
             if current_state == "FAIL":
-                return False, "state_machine_fail"
+                stats = {
+                    'collision_count': collision_count,
+                    'self_collision_count': sum(1 for o in harness.obs_history if o.self_collision),
+                    'table_collision_count': sum(1 for o in harness.obs_history if o.table_collision),
+                    'max_penetration': max_penetration_seen,
+                    'recover_time_steps': recover_time_steps,
+                    'initial_cube_pos': actual_initial_cube_pos.tolist() if actual_initial_cube_pos is not None else None,
+                    'goal_pos': goal_region_center.tolist(),
+                }
+                return False, "state_machine_fail", stats
             
             # Timeout in same state
             if harness.state_machine.state_visit_count > 2000:
-                return False, "timeout"
+                stats = {
+                    'collision_count': collision_count,
+                    'self_collision_count': sum(1 for o in harness.obs_history if o.self_collision),
+                    'table_collision_count': sum(1 for o in harness.obs_history if o.table_collision),
+                    'max_penetration': max_penetration_seen,
+                    'recover_time_steps': recover_time_steps,
+                    'initial_cube_pos': actual_initial_cube_pos.tolist() if actual_initial_cube_pos is not None else None,
+                    'goal_pos': goal_region_center.tolist(),
+                }
+                return False, "timeout", stats
         
         else:
             # MPC-only mode: simpler success criteria
             # Success if cube is displaced from initial position
-            if step > 500 and obs.x_obj_pos is not None and initial_cube_pos is not None:
-                displacement = np.linalg.norm(obs.x_obj_pos[:2] - initial_cube_pos[:2])
+            if step > 500 and obs.x_obj_pos is not None and actual_initial_cube_pos is not None:
+                displacement = np.linalg.norm(obs.x_obj_pos[:2] - actual_initial_cube_pos[:2])
                 ee_vel = np.linalg.norm(obs.xd_ee_lin) if hasattr(obs, 'xd_ee_lin') else 0.0
                 
                 # Check every 100 steps if stable displacement achieved
@@ -134,28 +196,91 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
                     # Success: cube displaced and system relatively stable
                     if displacement > MIN_DISPLACEMENT and ee_vel < 0.05:
                         # Check for safety violations
+                        stats = {
+                            'collision_count': collision_count,
+                            'self_collision_count': sum(1 for o in harness.obs_history if o.self_collision),
+                            'table_collision_count': sum(1 for o in harness.obs_history if o.table_collision),
+                            'max_penetration': max_penetration_seen,
+                            'recover_time_steps': recover_time_steps,
+                            'initial_cube_pos': actual_initial_cube_pos.tolist(),
+                            'goal_pos': goal_region_center.tolist(),
+                        }
                         if collision_count > MAX_COLLISION_COUNT:
-                            return False, "excessive_collisions"
-                        return True, None
+                            return False, "excessive_collisions", stats
+                        return True, None, stats
         
         # Safety violations trigger immediate failure (severity matters)
         if obs.self_collision:
-            return False, "self_collision"
+            stats = {
+                'collision_count': collision_count,
+                'self_collision_count': sum(1 for o in harness.obs_history if o.self_collision),
+                'table_collision_count': sum(1 for o in harness.obs_history if o.table_collision),
+                'max_penetration': max_penetration_seen,
+                'recover_time_steps': recover_time_steps,
+                'initial_cube_pos': actual_initial_cube_pos.tolist() if actual_initial_cube_pos is not None else None,
+                'goal_pos': goal_region_center.tolist(),
+            }
+            return False, "self_collision", stats
         if obs.table_collision and step > INITIAL_SETTLING_STEPS:  # Allow initial settling
-            return False, "table_collision"
+            stats = {
+                'collision_count': collision_count,
+                'self_collision_count': sum(1 for o in harness.obs_history if o.self_collision),
+                'table_collision_count': sum(1 for o in harness.obs_history if o.table_collision),
+                'max_penetration': max_penetration_seen,
+                'recover_time_steps': recover_time_steps,
+                'initial_cube_pos': actual_initial_cube_pos.tolist() if actual_initial_cube_pos is not None else None,
+                'goal_pos': goal_region_center.tolist(),
+            }
+            return False, "table_collision", stats
         if obs.penetration > 0.08:  # Very severe penetration
-            return False, "severe_penetration"
+            stats = {
+                'collision_count': collision_count,
+                'self_collision_count': sum(1 for o in harness.obs_history if o.self_collision),
+                'table_collision_count': sum(1 for o in harness.obs_history if o.table_collision),
+                'max_penetration': max_penetration_seen,
+                'recover_time_steps': recover_time_steps,
+                'initial_cube_pos': actual_initial_cube_pos.tolist() if actual_initial_cube_pos is not None else None,
+                'goal_pos': goal_region_center.tolist(),
+            }
+            return False, "severe_penetration", stats
         
         # Episode timeout
         if step >= max_steps - 1:
             # For MPC-only, check final state
-            if not harness.rfsn_enabled and obs.x_obj_pos is not None and initial_cube_pos is not None:
-                displacement = np.linalg.norm(obs.x_obj_pos[:2] - initial_cube_pos[:2])
+            if not harness.rfsn_enabled and obs.x_obj_pos is not None and actual_initial_cube_pos is not None:
+                displacement = np.linalg.norm(obs.x_obj_pos[:2] - actual_initial_cube_pos[:2])
+                stats = {
+                    'collision_count': collision_count,
+                    'self_collision_count': sum(1 for o in harness.obs_history if o.self_collision),
+                    'table_collision_count': sum(1 for o in harness.obs_history if o.table_collision),
+                    'max_penetration': max_penetration_seen,
+                    'recover_time_steps': recover_time_steps,
+                    'initial_cube_pos': actual_initial_cube_pos.tolist(),
+                    'goal_pos': goal_region_center.tolist(),
+                }
                 if displacement > MIN_DISPLACEMENT and collision_count <= MAX_COLLISION_COUNT:
-                    return True, None  # Partial success for MPC baseline
-            return False, "max_steps"
+                    return True, None, stats  # Partial success for MPC baseline
+            stats = {
+                'collision_count': collision_count,
+                'self_collision_count': sum(1 for o in harness.obs_history if o.self_collision),
+                'table_collision_count': sum(1 for o in harness.obs_history if o.table_collision),
+                'max_penetration': max_penetration_seen,
+                'recover_time_steps': recover_time_steps,
+                'initial_cube_pos': actual_initial_cube_pos.tolist() if actual_initial_cube_pos is not None else None,
+                'goal_pos': goal_region_center.tolist(),
+            }
+            return False, "max_steps", stats
     
-    return False, "unknown"
+    stats = {
+        'collision_count': collision_count,
+        'self_collision_count': sum(1 for o in harness.obs_history if o.self_collision),
+        'table_collision_count': sum(1 for o in harness.obs_history if o.table_collision),
+        'max_penetration': max_penetration_seen,
+        'recover_time_steps': recover_time_steps,
+        'initial_cube_pos': actual_initial_cube_pos.tolist() if actual_initial_cube_pos is not None else None,
+        'goal_pos': goal_region_center.tolist(),
+    }
+    return False, "unknown", stats
 
 
 def main():
@@ -175,8 +300,23 @@ def main():
                        help="MuJoCo model path")
     parser.add_argument("--run-dir", type=str, default=None,
                        help="Run directory (default: auto-generate)")
+    parser.add_argument("--seed", type=int, default=None,
+                       help="Random seed for deterministic runs (default: no seed)")
+    parser.add_argument("--randomize-cube", action="store_true",
+                       help="Randomize cube initial position each episode")
+    parser.add_argument("--randomize-goal", action="store_true",
+                       help="Randomize goal position each episode")
+    parser.add_argument("--cube-xy-range", type=float, default=0.15,
+                       help="Range for cube XY randomization (meters)")
+    parser.add_argument("--goal-xy-range", type=float, default=0.15,
+                       help="Range for goal XY randomization (meters)")
     
     args = parser.parse_args()
+    
+    # Set random seed if provided (for deterministic runs)
+    if args.seed is not None:
+        np.random.seed(args.seed)
+        print(f"Random seed set to: {args.seed}")
     
     print("=" * 70)
     print("RFSN BENCHMARK RUNNER")
@@ -186,6 +326,9 @@ def main():
     print(f"Task:           {args.task}")
     print(f"Max steps:      {args.max_steps}")
     print(f"Model:          {args.model}")
+    print(f"Seed:           {args.seed if args.seed is not None else 'None (random)'}")
+    print(f"Randomize cube: {args.randomize_cube}")
+    print(f"Randomize goal: {args.randomize_goal}")
     print("=" * 70)
     print()
     
@@ -213,25 +356,95 @@ def main():
     
     # Run episodes
     print("Running episodes...")
+    
+    # Default cube and goal positions
+    default_cube_pos = np.array([0.3, 0.0, 0.47])
+    default_goal_pos = np.array([-0.2, 0.3, 0.45])
+    
+    # Table bounds for randomization (stay away from edges)
+    table_x_range = [-0.35, 0.35]  # Keep 0.15m from table edges
+    table_y_range = [-0.35, 0.35]
+    table_height = 0.42  # Table surface height
+    cube_half_size = 0.025  # Cube half-size
+    
     for episode_id in range(args.episodes):
         print(f"\n[Episode {episode_id + 1}/{args.episodes}]")
+        
+        # Randomize cube initial position if requested
+        if args.randomize_cube:
+            cube_x = np.random.uniform(
+                max(table_x_range[0], default_cube_pos[0] - args.cube_xy_range),
+                min(table_x_range[1], default_cube_pos[0] + args.cube_xy_range)
+            )
+            cube_y = np.random.uniform(
+                max(table_y_range[0], default_cube_pos[1] - args.cube_xy_range),
+                min(table_y_range[1], default_cube_pos[1] + args.cube_xy_range)
+            )
+            cube_pos = np.array([cube_x, cube_y, table_height + cube_half_size + 0.05])
+            print(f"  Randomized cube position: [{cube_x:.3f}, {cube_y:.3f}, {cube_pos[2]:.3f}]")
+        else:
+            cube_pos = default_cube_pos.copy()
+        
+        # Randomize goal position if requested
+        if args.randomize_goal:
+            goal_x = np.random.uniform(
+                max(table_x_range[0], default_goal_pos[0] - args.goal_xy_range),
+                min(table_x_range[1], default_goal_pos[0] + args.goal_xy_range)
+            )
+            goal_y = np.random.uniform(
+                max(table_y_range[0], default_goal_pos[1] - args.goal_xy_range),
+                min(table_y_range[1], default_goal_pos[1] + args.goal_xy_range)
+            )
+            goal_pos = np.array([goal_x, goal_y, table_height + cube_half_size + 0.02])
+            print(f"  Randomized goal position: [{goal_x:.3f}, {goal_y:.3f}, {goal_pos[2]:.3f}]")
+        else:
+            goal_pos = default_goal_pos.copy()
         
         # Reset simulation
         mj.mj_resetData(model, data)
         data.qpos[:7] = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
+        
+        # Set cube position (find cube freejoint in qpos)
+        # Resolve cube freejoint joint index from the model to avoid hardcoded offsets.
+        # Assumes the MuJoCo XML defines a joint named "cube_freejoint" for the cube body.
+        cube_joint_name = "cube_freejoint"
+        cube_joint_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, cube_joint_name)
+        if cube_joint_id < 0:
+            raise RuntimeError(f"Cube freejoint '{cube_joint_name}' not found in the MuJoCo model.")
+        
+        # Cube freejoint qpos layout: [x, y, z, qw, qx, qy, qz] (7 values)
+        cube_qpos_start = model.jnt_qposadr[cube_joint_id]
+        data.qpos[cube_qpos_start:cube_qpos_start + 3] = cube_pos
+        data.qpos[cube_qpos_start + 3:cube_qpos_start + 7] = [1, 0, 0, 0]  # Identity quaternion
+        
+        # Zero cube velocity: 6-DOF freejoint velocity in qvel
+        cube_qvel_start = model.jnt_dofadr[cube_joint_id]
+        data.qvel[cube_qvel_start:cube_qvel_start + 6] = 0.0
+        
+        # Forward sim to settle
         mj.mj_forward(model, data)
         
-        # Start episode logging
-        logger.start_episode(episode_id, args.task)
+        # Start episode logging with initial positions
+        logger.start_episode(episode_id, args.task,
+                           initial_cube_pos=cube_pos.tolist(),
+                           goal_pos=goal_pos.tolist())
         
-        # Run episode
-        success, failure_reason = run_episode(harness, max_steps=args.max_steps)
+        # Run episode with initial positions
+        success, failure_reason, episode_stats = run_episode(
+            harness, 
+            max_steps=args.max_steps,
+            initial_cube_pos=cube_pos,
+            goal_pos=goal_pos
+        )
         
-        # End episode logging
+        # End episode logging with stats
         harness.end_episode(success, failure_reason)
         
         print(f"  Result: {'SUCCESS' if success else 'FAILURE'}" + 
               (f" ({failure_reason})" if failure_reason else ""))
+        print(f"  Collisions: {episode_stats.get('collision_count', 0)}, "
+              f"Max penetration: {episode_stats.get('max_penetration', 0.0):.4f}m, "
+              f"RECOVER steps: {episode_stats.get('recover_time_steps', 0)}")
     
     print("\n" + "=" * 70)
     print("BENCHMARK COMPLETE")
