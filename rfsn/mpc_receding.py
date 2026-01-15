@@ -205,9 +205,9 @@ class RecedingHorizonMPC:
             q_traj, qd_traj = self._rollout_dynamics(q, qd, qdd_trajectory, dt, H)
             
             # Compute cost
-                improvement = (cost_history[-2] - cost_history[-1]) / (abs(cost_history[-2]) + 1e-8)
-                if abs(improvement) < self.config.convergence_tol:
-                    converged = True
+            cost_total, _ = self._compute_cost(
+                q_traj, qd_traj, qdd_trajectory, q_target,
+                Q_pos, Q_vel, R, Q_terminal_pos, du_penalty,
                 joint_limits
             )
             cost_history.append(cost_total)
