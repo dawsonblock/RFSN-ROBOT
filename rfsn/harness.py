@@ -43,11 +43,29 @@ class RFSNHarness:
     - "rfsn": RFSN state machine generates EE targets → IK → joint targets → PD
     - "rfsn_learning": Same as "rfsn" with UCB profile learning
     
-    RFSN Profile Knobs Actually Control:
-    - horizon_steps: Not used in current PD implementation
-    - Q_diag: Scales PD position gains (KP)
-    - R_diag: Not directly used (could scale KD in future)
-    - max_tau_scale: Multiplies output torques
+    CRITICAL: Profile "MPC Parameters" Are Actually PD Control Proxies
+    ===================================================================
+    Despite naming, profiles do NOT configure true MPC. They map to PD control:
+    
+    - horizon_steps: PROXY for IK iteration count (more iterations = finer convergence)
+                     NOT an MPC prediction horizon
+    
+    - Q_diag[0:7]:   PROXY for PD position gains (KP_scale = sqrt(Q_pos / 50.0))
+                     Higher Q → higher KP → stiffer position tracking
+    
+    - Q_diag[7:14]:  PROXY for PD velocity gains (KD_scale = sqrt(Q_vel / 10.0))
+                     Higher Q_vel → higher KD → more damping
+    
+    - R_diag:        NOT USED in current implementation
+                     Reserved for future control effort penalty
+    
+    - du_penalty:    NOT USED in current implementation
+                     Reserved for future rate limiting or smoothing
+    
+    - max_tau_scale: Direct torque multiplier (≤1.0 for safety)
+                     Reduces available torque to prevent aggressive motion
+    
+    Learning selects among these proxy profiles, NOT raw control actions.
     """
     
     def __init__(
@@ -109,6 +127,7 @@ class RFSNHarness:
         self.episode_active = False
         self.obs_history = []
         self.decision_history = []
+        self.initial_cube_z = None  # Track initial cube height for grasp quality
         
     def start_episode(self):
         """Start a new episode."""
@@ -117,6 +136,7 @@ class RFSNHarness:
         self.episode_active = True
         self.obs_history = []
         self.decision_history = []
+        self.initial_cube_z = None
         
         if self.rfsn_enabled:
             self.state_machine.reset()
@@ -139,6 +159,10 @@ class RFSNHarness:
             task_name=self.task_name
         )
         
+        # Track initial cube height on first step
+        if self.initial_cube_z is None and obs.x_obj_pos is not None:
+            self.initial_cube_z = obs.x_obj_pos[2]
+        
         # Generate decision
         if self.rfsn_enabled:
             # RFSN mode: state machine generates decision
@@ -150,7 +174,13 @@ class RFSNHarness:
                     safety_poison_check=self.safety_clamp.is_poisoned
                 )
             
-            decision = self.state_machine.step(obs, profile_override=profile_variant)
+            # Compute grasp quality for GRASP state
+            grasp_quality = None
+            if self.state_machine.current_state == "GRASP":
+                grasp_quality = self._check_grasp_quality(obs, self.initial_cube_z)
+            
+            decision = self.state_machine.step(obs, profile_override=profile_variant,
+                                              grasp_quality=grasp_quality)
             
             # Apply safety clamps
             decision = self.safety_clamp.apply(decision, obs)
@@ -284,23 +314,45 @@ class RFSNHarness:
             self.logger.end_episode(success, failure_reason)
 
     
-    def _ee_target_to_joint_target(self, decision: RFSNDecision) -> np.ndarray:
+    def _ee_target_to_joint_target(self, decision: RFSNDecision, use_orientation: bool = None) -> np.ndarray:
         """
         Convert end-effector target to joint target using damped least squares IK.
         
-        Uses MuJoCo Jacobian and iterative position-based IK with damping.
+        Args:
+            decision: Decision containing target pose and horizon_steps
+            use_orientation: If True, include orientation in IK. If None, auto-decide based on state.
+        
+        Uses MuJoCo Jacobian and iterative pose-based (position + orientation) IK with damping.
+        Orientation is soft-weighted and optional per state for stability.
+        
+        PROXY MAPPING: decision.horizon_steps → IK max_iterations
+        Higher horizon → more IK iterations → finer convergence (but slower)
         """
         q_current = self.data.qpos[:7].copy()
         
         # Get end-effector body ID
         ee_body_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, "panda_hand")
         
+        # Decide whether to use orientation based on state (if not explicitly specified)
+        if use_orientation is None:
+            # Enable orientation for states where precise pose matters
+            use_orientation = decision.task_mode in ["GRASP", "PLACE", "REACH_GRASP"]
+        
         # Iterative IK with damped least squares
         q_ik = q_current.copy()
         alpha = 0.5  # Step size
-        damping = 0.01  # Damping factor for numerical stability
-        max_iterations = 10
+        damping_pos = 0.01  # Position damping for stability
+        damping_rot = 0.05  # Higher rotation damping (orientation is soft)
+        
+        # PROXY: Use horizon_steps as max IK iterations (clamped for safety)
+        # More iterations = more precise convergence = "longer planning horizon" metaphor
+        max_iterations = min(max(decision.horizon_steps, 5), 20)  # Clamp to [5, 20]
+        
         pos_tolerance = 0.01  # 1cm
+        ori_tolerance = 0.1   # Quaternion distance tolerance
+        
+        # Orientation weight (soft constraint)
+        ori_weight = 0.3  # Lower weight than position (soft orientation)
         
         for iteration in range(max_iterations):
             # Update MuJoCo data with current joint positions
@@ -309,29 +361,48 @@ class RFSNHarness:
             data_temp.qpos[:7] = q_ik
             mj.mj_forward(self.model, data_temp)
             
-            # Get current EE position
+            # Get current EE pose
             ee_pos_current = data_temp.xpos[ee_body_id].copy()
+            ee_quat_current = data_temp.xquat[ee_body_id].copy()  # [w, x, y, z]
             
             # Compute position error
             pos_error = decision.x_target_pos - ee_pos_current
             
+            # Compute orientation error (axis-angle from quaternion difference)
+            ori_error = np.zeros(3)
+            if use_orientation:
+                ori_error = self._quaternion_error(ee_quat_current, decision.x_target_quat)
+            
             # Check convergence
-            if np.linalg.norm(pos_error) < pos_tolerance:
+            pos_converged = np.linalg.norm(pos_error) < pos_tolerance
+            ori_converged = np.linalg.norm(ori_error) < ori_tolerance if use_orientation else True
+            if pos_converged and ori_converged:
                 break
             
-            # Compute Jacobian for end-effector position
+            # Compute Jacobians
             jacp = np.zeros((3, self.model.nv))  # Position Jacobian
             jacr = np.zeros((3, self.model.nv))  # Rotation Jacobian
             mj.mj_jacBodyCom(self.model, data_temp, jacp, jacr, ee_body_id)
             
             # Extract arm joints only (first 7 DOF)
-            J = jacp[:, :7]
+            J_pos = jacp[:, :7]
+            J_rot = jacr[:, :7]
             
-            # Damped least squares: dq = J^T (J J^T + λ²I)^{-1} * dx
-            # This is more stable than pseudo-inverse for redundant manipulators
-            JJT = J @ J.T
-            damping_matrix = damping**2 * np.eye(3)
-            dq = J.T @ np.linalg.solve(JJT + damping_matrix, pos_error)
+            if use_orientation:
+                # Combine position and orientation Jacobians
+                # Stack: [position (3), orientation (3)]
+                J = np.vstack([J_pos, ori_weight * J_rot])
+                error = np.concatenate([pos_error, ori_weight * ori_error])
+                
+                # Damped least squares with combined Jacobian
+                JJT = J @ J.T
+                damping_matrix = np.diag([damping_pos**2] * 3 + [damping_rot**2] * 3)
+                dq = J.T @ np.linalg.solve(JJT + damping_matrix, error)
+            else:
+                # Position-only IK (original behavior)
+                JJT = J_pos @ J_pos.T
+                damping_matrix = damping_pos**2 * np.eye(3)
+                dq = J_pos.T @ np.linalg.solve(JJT + damping_matrix, pos_error)
             
             # Update joint angles with step size
             q_ik += alpha * dq
@@ -344,6 +415,49 @@ class RFSNHarness:
         
         return q_ik
     
+    def _quaternion_error(self, q_current: np.ndarray, q_target: np.ndarray) -> np.ndarray:
+        """
+        Compute orientation error as axis-angle from quaternion difference.
+        
+        Args:
+            q_current: Current quaternion [w, x, y, z]
+            q_target: Target quaternion [w, x, y, z]
+        
+        Returns:
+            axis-angle error (3,) for use in Jacobian IK
+        """
+        # Ensure quaternions are normalized
+        q_current = q_current / np.linalg.norm(q_current)
+        q_target = q_target / np.linalg.norm(q_target)
+        
+        # Compute quaternion difference: q_error = q_target * q_current^{-1}
+        # Quaternion conjugate (inverse for unit quaternions)
+        q_current_conj = np.array([q_current[0], -q_current[1], -q_current[2], -q_current[3]])
+        
+        # Quaternion multiplication: q_error = q_target * q_current_conj
+        w1, x1, y1, z1 = q_target
+        w2, x2, y2, z2 = q_current_conj
+        
+        q_error = np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,  # w
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,  # x
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,  # y
+            w1*z2 + x1*y2 - y1*x2 + z1*w2   # z
+        ])
+        
+        # Convert to axis-angle (small angle approximation for stability)
+        # For small rotations: axis * angle ≈ 2 * [x, y, z] components
+        # This is valid when w ≈ 1 (small rotation)
+        axis_angle = 2.0 * q_error[1:4]
+        
+        # Clamp to prevent large corrections
+        max_angle = 0.5  # ~28 degrees max per iteration
+        angle_norm = np.linalg.norm(axis_angle)
+        if angle_norm > max_angle:
+            axis_angle = axis_angle * (max_angle / angle_norm)
+        
+        return axis_angle
+    
     def _inverse_dynamics_control(
         self,
         q: np.ndarray,
@@ -354,22 +468,35 @@ class RFSNHarness:
         """
         Compute control torques using inverse dynamics.
         
-        Uses MuJoCo's mj_inverse to compute required torques.
+        Uses MuJoCo's mj_inverse to compute required torques for PD control.
+        
+        Profile Parameter Mapping (EXPLICIT):
+        =====================================
+        - Q_diag[0:7]  → KP_scale = sqrt(Q_pos / 50.0) → Position stiffness
+        - Q_diag[7:14] → KD_scale = sqrt(Q_vel / 10.0) → Velocity damping
+        - R_diag       → NOT USED (future: control effort penalty)
+        - du_penalty   → NOT USED (future: acceleration smoothing)
+        - max_tau_scale→ DIRECT multiplier on output torques (safety limiter)
+        
+        This is NOT MPC despite profile naming. It's gain-scheduled PD control.
         """
-        # Apply MPC gains (from decision if available)
+        # Map profile "Q" parameters to PD gains (EXPLICIT PROXY MAPPING)
         if decision:
-            # Scale KP based on Q weights
-            kp_scale = np.sqrt(decision.Q_diag[:7] / 50.0)  # Normalized to base
+            # Q_diag[0:7] controls position stiffness via KP scaling
+            kp_scale = np.sqrt(decision.Q_diag[:7] / 50.0)  # Normalized to base=50
             KP_local = self.KP * kp_scale
             
-            # Scale KD based on Q velocity weights
-            kd_scale = np.sqrt(decision.Q_diag[7:14] / 10.0)
+            # Q_diag[7:14] controls velocity damping via KD scaling
+            kd_scale = np.sqrt(decision.Q_diag[7:14] / 10.0)  # Normalized to base=10
             KD_local = self.KD * kd_scale
+            
+            # Note: R_diag and du_penalty are NOT used in current implementation
+            # They exist for potential future extensions (control effort, smoothing)
         else:
             KP_local = self.KP
             KD_local = self.KD
         
-        # PD control
+        # PD control law
         q_error = q_target - q
         dq_desired = KP_local * q_error
         
@@ -378,16 +505,16 @@ class RFSNHarness:
         data_temp.qpos[:] = self.data.qpos
         data_temp.qvel[:] = self.data.qvel
         
-        # Set desired acceleration
+        # Set desired acceleration (PD output)
         qacc_full = np.zeros(self.model.nv)
         qacc_full[:7] = dq_desired - KD_local * qd
         data_temp.qacc[:] = qacc_full
         
-        # Compute inverse dynamics
+        # Compute inverse dynamics (maps acceleration to torques)
         mj.mj_inverse(self.model, data_temp)
         tau = data_temp.qfrc_inverse[:7].copy()
         
-        # Apply torque scale if decision provided
+        # Apply torque scale (PROXY: max_tau_scale as safety limiter)
         if decision:
             tau *= decision.max_tau_scale
         
@@ -396,20 +523,31 @@ class RFSNHarness:
         
         return tau
     
-    def _check_grasp_quality(self, obs: ObsPacket) -> dict:
+    def _check_grasp_quality(self, obs: ObsPacket, initial_cube_z: float = None) -> dict:
         """
-        Check grasp quality based on contacts and gripper state.
+        Check grasp quality based on contacts, gripper state, and cube attachment.
+        
+        Args:
+            obs: Current observation
+            initial_cube_z: Initial cube height (for attachment detection)
         
         Returns:
             {
                 'has_contact': bool - whether fingers are in contact with object
                 'is_stable': bool - whether grasp is stable (both fingers, low motion)
+                'is_attached': bool - whether cube is following EE (attachment proxy)
                 'quality': float - grasp quality score 0-1
             }
         """
+        # Grasp quality thresholds
+        GRIPPER_CLOSED_WIDTH = 0.06  # Gripper width threshold for "closed" (meters)
+        LOW_VELOCITY_THRESHOLD = 0.1  # EE velocity threshold for "stable" (m/s)
+        LIFT_HEIGHT_THRESHOLD = 0.02  # Minimum lift to confirm attachment (meters)
+        
         result = {
             'has_contact': obs.obj_contact and obs.ee_contact,
             'is_stable': False,
+            'is_attached': False,
             'quality': 0.0
         }
         
@@ -419,28 +557,35 @@ class RFSNHarness:
         
         # Check gripper width (closed enough)
         gripper_width = obs.gripper.get('width', 0.0)
-        is_closed = gripper_width < 0.06  # Gripper should be mostly closed
+        is_closed = gripper_width < GRIPPER_CLOSED_WIDTH
         
         # Check relative motion (EE velocity as proxy for grasp stability)
         # Note: ObsPacket doesn't include object velocity, so we use EE velocity
         # which should be low during stable grasp
         if obs.x_obj_pos is not None:
             ee_vel_norm = np.linalg.norm(obs.xd_ee_lin)
-            is_low_motion = ee_vel_norm < 0.1  # Less than 10cm/s
+            is_low_motion = ee_vel_norm < LOW_VELOCITY_THRESHOLD
+            
+            # Check cube attachment: cube should have lifted from initial position
+            if initial_cube_z is not None:
+                cube_lifted = obs.x_obj_pos[2] > (initial_cube_z + LIFT_HEIGHT_THRESHOLD)
+                result['is_attached'] = cube_lifted
         else:
             is_low_motion = True
         
-        # Grasp is stable if closed and low motion
+        # Grasp is stable if closed, low motion, and has contact
         result['is_stable'] = is_closed and is_low_motion and result['has_contact']
         
         # Compute quality score
         quality = 0.0
         if result['has_contact']:
-            quality += 0.4
+            quality += 0.3  # Contact
         if is_closed:
-            quality += 0.3
+            quality += 0.25  # Gripper closed
         if is_low_motion:
-            quality += 0.3
+            quality += 0.2  # Low velocity
+        if result['is_attached']:
+            quality += 0.25  # Cube lifted (strong indicator)
         
         result['quality'] = quality
         
