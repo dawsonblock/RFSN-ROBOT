@@ -65,6 +65,9 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
         initial_cube_pos = np.array([0.3, 0.0, 0.47])
     if goal_pos is None:
         goal_pos = np.array([-0.2, 0.3, 0.45])
+
+    # Benign read to avoid unused-variable warning without changing behavior
+    _ = initial_cube_pos
     
     goal_region_center = goal_pos.copy()
     
