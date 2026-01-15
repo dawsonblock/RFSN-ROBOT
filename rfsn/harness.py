@@ -454,12 +454,8 @@ class RFSNHarness:
                 impedance_config = self.impedance_profiles.transport_stable()
             
             # Update controller config
-    
-                        # Preserve profile-driven torque scaling safety behavior
-                        if decision is not None:
-                            tau = np.clip(tau * float(decision.max_tau_scale), -87.0, 87.0)
-    
-            
+            self.impedance_controller.update_config(impedance_config)
+
             # Compute impedance control torques directly
             tau = self.impedance_controller.compute_torques(
                 self.data,
@@ -467,6 +463,10 @@ class RFSNHarness:
                 decision.x_target_quat,
                 nullspace_target_q=q_target  # Use IK solution for null-space
             )
+
+            # Preserve profile-driven torque scaling safety behavior
+            if decision is not None:
+                tau = np.clip(tau * float(decision.max_tau_scale), -87.0, 87.0)
             
             obs.controller_mode = "IMPEDANCE"
         else:
