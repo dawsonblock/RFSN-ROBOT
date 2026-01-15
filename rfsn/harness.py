@@ -1,12 +1,20 @@
 """
-RFSN-MPC Unified Harness
-=========================
-Main integration point: wraps MPC controller with RFSN executive layer.
+RFSN Unified Harness
+====================
+Main integration point: wraps low-level controller with RFSN executive layer.
+
+IMPORTANT: Despite naming conventions, this currently uses PD control + MuJoCo inverse
+dynamics (mj_inverse), NOT true Model Predictive Control (MPC). The "MPC knobs" from
+RFSN profiles actually control PD gains (KP/KD) and torque scaling.
+
+The FastMPCController exists but is not integrated into this control loop.
+To use actual MPC, FastMPCController.compute() would need to be called to generate
+trajectory references.
 
 Supports 3 modes:
-1. MPC only (baseline)
-2. RFSN without learning
-3. RFSN with learning
+1. "mpc_only" (baseline): PD + inverse dynamics with fixed joint target
+2. "rfsn": RFSN state machine generates EE targets, converted via IK to joint targets
+3. "rfsn_learning": Same as rfsn, with UCB-based profile learning
 """
 
 import mujoco as mj
@@ -26,12 +34,20 @@ from rfsn.mujoco_utils import build_obs_packet
 
 class RFSNHarness:
     """
-    Unified harness for MPC + RFSN integration.
+    Unified harness for PD control + RFSN integration.
+    
+    Control Law: PD control in joint space + MuJoCo inverse dynamics (mj_inverse)
     
     Modes:
-    - "mpc_only": Baseline MPC with fixed targets
-    - "rfsn": RFSN state machine without learning
-    - "rfsn_learning": RFSN state machine with safe learning
+    - "mpc_only": Baseline PD control with fixed joint targets
+    - "rfsn": RFSN state machine generates EE targets → IK → joint targets → PD
+    - "rfsn_learning": Same as "rfsn" with UCB profile learning
+    
+    RFSN Profile Knobs Actually Control:
+    - horizon_steps: Not used in current PD implementation
+    - Q_diag: Scales PD position gains (KP)
+    - R_diag: Not directly used (could scale KD in future)
+    - max_tau_scale: Multiplies output torques
     """
     
     def __init__(
@@ -152,17 +168,24 @@ class RFSNHarness:
         # Apply control
         self.data.ctrl[:7] = tau
         
-        # Gripper control (simple open/close)
+        # Gripper control with proper grasp detection
         if self.rfsn_enabled and decision:
-            if decision.task_mode in ["GRASP", "LIFT", "TRANSPORT"]:
-                self.data.ctrl[7] = -50.0  # Close left
-                self.data.ctrl[8] = 50.0   # Close right
+            if decision.task_mode in ["GRASP", "LIFT", "TRANSPORT", "PLACE"]:
+                # Close gripper with force control
+                self.data.ctrl[7] = -80.0  # Close left finger
+                self.data.ctrl[8] = 80.0   # Close right finger
+            elif decision.task_mode in ["REACH_PREGRASP", "REACH_GRASP"]:
+                # Pre-open gripper for approach
+                self.data.ctrl[7] = 40.0   # Open left finger
+                self.data.ctrl[8] = -40.0  # Open right finger
             else:
-                self.data.ctrl[7] = 0.0
-                self.data.ctrl[8] = 0.0
+                # Neutral/open position
+                self.data.ctrl[7] = 20.0
+                self.data.ctrl[8] = -20.0
         else:
-            self.data.ctrl[7] = 0.0
-            self.data.ctrl[8] = 0.0
+            # MPC-only mode: keep gripper open
+            self.data.ctrl[7] = 20.0
+            self.data.ctrl[8] = -20.0
         
         # Step simulation
         mj.mj_step(self.model, self.data)
@@ -209,7 +232,7 @@ class RFSNHarness:
         return obs
     
     def end_episode(self, success: bool = False, failure_reason: str = None):
-        """End current episode."""
+        """End current episode and update learning with safety coupling."""
         self.episode_active = False
         
         # Update learner if enabled
@@ -219,57 +242,106 @@ class RFSNHarness:
                 self.decision_history
             )
             
-            # Update stats for each (state, profile) used
-            state_profile_visits = {}
-            for decision in self.decision_history:
-                key = (decision.task_mode, decision.rollback_token.split('_')[1] if '_' in decision.rollback_token else 'base')
-                state_profile_visits[key] = state_profile_visits.get(key, 0) + 1
+            # Track which (state, profile) pairs were used and count severe events per pair
+            state_profile_usage = {}  # (state, profile) -> {'count': int, 'severe_events': int}
             
-            for (state, profile), count in state_profile_visits.items():
-                self.learner.update_stats(state, profile, score, violations, self.t)
+            for i, decision in enumerate(self.decision_history):
+                # Extract profile name from rollback token
+                profile_name = decision.rollback_token.split('_')[1] if '_' in decision.rollback_token else 'base'
+                key = (decision.task_mode, profile_name)
+                
+                if key not in state_profile_usage:
+                    state_profile_usage[key] = {'count': 0, 'severe_events': 0}
+                
+                state_profile_usage[key]['count'] += 1
+                
+                # Count severe events at this step
+                if i < len(self.obs_history):
+                    obs = self.obs_history[i]
+                    if (obs.self_collision or obs.table_collision or 
+                        obs.penetration > 0.05 or obs.torque_sat_count >= 5):
+                        state_profile_usage[key]['severe_events'] += 1
+            
+            # Update stats and poison profiles with repeated severe events
+            for (state, profile), usage_info in state_profile_usage.items():
+                # Update learner statistics
+                profile_score = score / len(state_profile_usage)  # Distribute score
+                profile_violations = usage_info['severe_events']
+                
+                self.learner.update_stats(state, profile, profile_score, profile_violations, self.t)
+                
+                # Check if this profile should be poisoned (2+ severe events in last 5 uses)
+                stats = self.learner.stats[(state, profile)]
+                if stats.N >= 5:
+                    recent_severe_count = sum(1 for s in stats.recent_scores[-5:] if s < -5.0)
+                    if recent_severe_count >= 2:
+                        # Poison this profile to prevent future selection
+                        self.safety_clamp.poison_profile(state, profile)
+                        print(f"[HARNESS] Poisoned ({state}, {profile}) due to repeated severe events")
         
         if self.logger:
             self.logger.end_episode(success, failure_reason)
+
     
     def _ee_target_to_joint_target(self, decision: RFSNDecision) -> np.ndarray:
         """
-        Convert end-effector target to joint target.
+        Convert end-effector target to joint target using damped least squares IK.
         
-        This is a simplified IK stub. Real implementation would use:
-        - MuJoCo's IK solver
-        - Analytical IK for Panda
-        - Numerical optimization
-        
-        For now, we return a reasonable joint configuration.
+        Uses MuJoCo Jacobian and iterative position-based IK with damping.
         """
-        # Simplified: use current joint config and adjust based on EE target
-        # This is NOT proper IK but allows the system to function
         q_current = self.data.qpos[:7].copy()
         
-        # Get current EE position
+        # Get end-effector body ID
         ee_body_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, "panda_hand")
-        ee_pos_current = self.data.xpos[ee_body_id].copy()
         
-        # Compute error
-        pos_error = decision.x_target_pos - ee_pos_current
+        # Iterative IK with damped least squares
+        q_ik = q_current.copy()
+        alpha = 0.5  # Step size
+        damping = 0.01  # Damping factor for numerical stability
+        max_iterations = 10
+        pos_tolerance = 0.01  # 1cm
         
-        # Simple Jacobian-based adjustment (very approximate)
-        # In practice, use mj_jacBodyCom or proper IK
-        q_target = q_current.copy()
+        for iteration in range(max_iterations):
+            # Update MuJoCo data with current joint positions
+            data_temp = mj.MjData(self.model)
+            data_temp.qpos[:] = self.data.qpos
+            data_temp.qpos[:7] = q_ik
+            mj.mj_forward(self.model, data_temp)
+            
+            # Get current EE position
+            ee_pos_current = data_temp.xpos[ee_body_id].copy()
+            
+            # Compute position error
+            pos_error = decision.x_target_pos - ee_pos_current
+            
+            # Check convergence
+            if np.linalg.norm(pos_error) < pos_tolerance:
+                break
+            
+            # Compute Jacobian for end-effector position
+            jacp = np.zeros((3, self.model.nv))  # Position Jacobian
+            jacr = np.zeros((3, self.model.nv))  # Rotation Jacobian
+            mj.mj_jacBodyCom(self.model, data_temp, jacp, jacr, ee_body_id)
+            
+            # Extract arm joints only (first 7 DOF)
+            J = jacp[:, :7]
+            
+            # Damped least squares: dq = J^T (J J^T + λ²I)^{-1} * dx
+            # This is more stable than pseudo-inverse for redundant manipulators
+            JJT = J @ J.T
+            damping_matrix = damping**2 * np.eye(3)
+            dq = J.T @ np.linalg.solve(JJT + damping_matrix, pos_error)
+            
+            # Update joint angles with step size
+            q_ik += alpha * dq
+            
+            # Clamp to joint limits
+            for i in range(7):
+                q_min = self.model.jnt_range[i, 0]
+                q_max = self.model.jnt_range[i, 1]
+                q_ik[i] = np.clip(q_ik[i], q_min, q_max)
         
-        # Adjust joint 2 for vertical (Z)
-        q_target[1] += pos_error[2] * 0.5
-        
-        # Adjust joint 1 for rotation around Z
-        q_target[0] += np.arctan2(decision.x_target_pos[1], decision.x_target_pos[0]) * 0.3
-        
-        # Clamp to joint limits
-        for i in range(7):
-            q_min = self.model.jnt_range[i, 0]
-            q_max = self.model.jnt_range[i, 1]
-            q_target[i] = np.clip(q_target[i], q_min, q_max)
-        
-        return q_target
+        return q_ik
     
     def _inverse_dynamics_control(
         self,
@@ -312,6 +384,67 @@ class RFSNHarness:
         
         # Compute inverse dynamics
         mj.mj_inverse(self.model, data_temp)
+        tau = data_temp.qfrc_inverse[:7].copy()
+        
+        # Apply torque scale if decision provided
+        if decision:
+            tau *= decision.max_tau_scale
+        
+        # Saturate
+        tau = np.clip(tau, -87.0, 87.0)
+        
+        return tau
+    
+    def _check_grasp_quality(self, obs: ObsPacket) -> dict:
+        """
+        Check grasp quality based on contacts and gripper state.
+        
+        Returns:
+            {
+                'has_contact': bool - whether fingers are in contact with object
+                'is_stable': bool - whether grasp is stable (both fingers, low motion)
+                'quality': float - grasp quality score 0-1
+            }
+        """
+        result = {
+            'has_contact': obs.obj_contact and obs.ee_contact,
+            'is_stable': False,
+            'quality': 0.0
+        }
+        
+        # Check if both fingers are in contact
+        if not result['has_contact']:
+            return result
+        
+        # Check gripper width (closed enough)
+        gripper_width = obs.gripper.get('width', 0.0)
+        is_closed = gripper_width < 0.06  # Gripper should be mostly closed
+        
+        # Check relative motion (object should move with EE)
+        if obs.x_obj_pos is not None:
+            # Object velocity should be small relative to workspace
+            obj_vel_norm = np.linalg.norm(obs.xd_ee_lin)
+            is_low_motion = obj_vel_norm < 0.1  # Less than 10cm/s
+        else:
+            is_low_motion = True
+        
+        # Grasp is stable if closed and low motion
+        result['is_stable'] = is_closed and is_low_motion and result['has_contact']
+        
+        # Compute quality score
+        quality = 0.0
+        if result['has_contact']:
+            quality += 0.4
+        if is_closed:
+            quality += 0.3
+        if is_low_motion:
+            quality += 0.3
+        
+        result['quality'] = quality
+        
+        return result
+    
+    def get_stats(self) -> dict:
         tau = data_temp.qfrc_inverse[:7].copy()
         
         # Apply torque scale if decision provided
