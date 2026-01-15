@@ -50,9 +50,14 @@ class ObsPacket:
     # Controller diagnostics
     mpc_converged: bool = True
     mpc_solve_time_ms: float = 0.0
+    mpc_iters: int = 0  # V7: MPC iteration count
+    mpc_cost_total: float = 0.0  # V7: MPC total cost
+    controller_mode: str = "ID_SERVO"  # V7: "ID_SERVO" or "MPC_TRACKING"
+    fallback_used: bool = False  # V7: MPC failed, fell back to ID_SERVO
+    mpc_failure_reason: Optional[str] = None  # V7: Reason for MPC fallback
     torque_sat_count: int = 0
     joint_limit_proximity: float = 0.0  # 0..1, max across joints
-    cost_total: float = 0.0
+    cost_total: float = 0.0  # Legacy field for compatibility
     
     # Episode signals
     task_name: str = "unknown"
@@ -84,8 +89,13 @@ class ObsPacket:
             'table_collision': self.table_collision,
             'self_collision': self.self_collision,
             'penetration': self.penetration,
+            'controller_mode': self.controller_mode,
             'mpc_converged': self.mpc_converged,
             'mpc_solve_time_ms': self.mpc_solve_time_ms,
+            'mpc_iters': self.mpc_iters,
+            'mpc_cost_total': self.mpc_cost_total,
+            'fallback_used': self.fallback_used,
+            'mpc_failure_reason': self.mpc_failure_reason,
             'torque_sat_count': self.torque_sat_count,
             'joint_limit_proximity': self.joint_limit_proximity,
             'task_name': self.task_name,

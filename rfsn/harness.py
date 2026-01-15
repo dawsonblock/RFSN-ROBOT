@@ -74,7 +74,8 @@ class RFSNHarness:
         data: mj.MjData,
         mode: str = "mpc_only",
         task_name: str = "pick_place",
-        logger: Optional[RFSNLogger] = None
+        logger: Optional[RFSNLogger] = None,
+        controller_mode: str = "ID_SERVO"
     ):
         """
         Initialize RFSN harness.
@@ -85,14 +86,17 @@ class RFSNHarness:
             mode: Control mode ("mpc_only", "rfsn", "rfsn_learning")
             task_name: Task name
             logger: Optional logger
+            controller_mode: "ID_SERVO" (v6 baseline) or "MPC_TRACKING" (v7 real MPC)
         """
         assert mode in ["mpc_only", "rfsn", "rfsn_learning"]
+        assert controller_mode in ["ID_SERVO", "MPC_TRACKING"]
         
         self.model = model
         self.data = data
         self.mode = mode
         self.task_name = task_name
         self.logger = logger
+        self.controller_mode = controller_mode
         
         self.dt = model.opt.timestep
         self.t = 0.0
@@ -138,6 +142,30 @@ class RFSNHarness:
         self.decision_history = []
         self.initial_cube_z = None  # Track initial cube height for grasp quality
         
+        # V7: MPC integration
+        self.mpc_enabled = (controller_mode == "MPC_TRACKING")
+        self.mpc_solver = None
+        self.mpc_steps_used = 0
+        self.mpc_failures = 0
+        self.mpc_failure_streak = 0
+        self.mpc_disabled_for_episode = False
+        self.mpc_solve_times = []  # Track solve times for averaging
+        
+        if self.mpc_enabled:
+            from rfsn.mpc_receding import RecedingHorizonMPC, MPCConfig
+            mpc_config = MPCConfig(
+                H_min=5,
+                H_max=30,
+                max_iterations=100,
+                time_budget_ms=50.0,
+                learning_rate=0.1,
+                warm_start=True
+            )
+            self.mpc_solver = RecedingHorizonMPC(mpc_config)
+            print("[HARNESS] MPC_TRACKING mode enabled - using real receding horizon MPC")
+        else:
+            print("[HARNESS] ID_SERVO mode (v6 baseline) - using inverse dynamics PD control")
+        
         # V6: Grasp validation history buffer
         self.grasp_history = None
         if self.rfsn_enabled:
@@ -152,6 +180,16 @@ class RFSNHarness:
         self.obs_history = []
         self.decision_history = []
         self.initial_cube_z = None
+        
+        # V7: Reset MPC tracking
+        self.mpc_steps_used = 0
+        self.mpc_failures = 0
+        self.mpc_failure_streak = 0
+        self.mpc_disabled_for_episode = False
+        self.mpc_solve_times = []
+        
+        if self.mpc_solver:
+            self.mpc_solver.reset_warm_start()
         
         # Reset grasp validation history
         if self.grasp_history:
@@ -243,8 +281,72 @@ class RFSNHarness:
             decision = None
             q_target = self.baseline_target_q.copy()
         
-        # Compute control (inverse dynamics)
-        tau = self._inverse_dynamics_control(obs.q, obs.qd, q_target, decision)
+        # V7: MPC integration - compute control using MPC or fallback to ID
+        use_mpc = (self.mpc_enabled and not self.mpc_disabled_for_episode and 
+                   decision is not None and self.safety_clamp.last_severe_event is None)
+        
+        q_ref = q_target  # Default: track IK target directly
+        qd_ref = np.zeros(7)  # Default: zero velocity target
+        mpc_result = None
+        
+        if use_mpc:
+            # Try MPC solve
+            try:
+                # Prepare decision parameters for MPC
+                mpc_params = {
+                    'horizon_steps': decision.horizon_steps,
+                    'Q_diag': decision.Q_diag,
+                    'R_diag': decision.R_diag,
+                    'terminal_Q_diag': decision.terminal_Q_diag,
+                    'du_penalty': decision.du_penalty,
+                    'joint_limit_proximity': obs.joint_limit_proximity
+                }
+                
+                # Get joint limits from model
+                joint_limits = (self.model.jnt_range[:7, 0], self.model.jnt_range[:7, 1])
+                
+                # Solve MPC
+                mpc_result = self.mpc_solver.solve(
+                    obs.q, obs.qd, q_target, self.dt, mpc_params, joint_limits
+                )
+                
+                # Check if MPC succeeded
+                if mpc_result.converged or mpc_result.reason == "max_iters":
+                    # Use MPC output as reference for ID controller
+                    q_ref = mpc_result.q_ref_next
+                    qd_ref = mpc_result.qd_ref_next
+                    
+                    # Update tracking
+                    self.mpc_steps_used += 1
+                    self.mpc_failure_streak = 0
+                    self.mpc_solve_times.append(mpc_result.solve_time_ms)
+                    
+                    # Update obs with MPC diagnostics
+                    obs.controller_mode = "MPC_TRACKING"
+                    obs.mpc_converged = mpc_result.converged
+                    obs.mpc_solve_time_ms = mpc_result.solve_time_ms
+                    obs.mpc_iters = mpc_result.iters
+                    obs.mpc_cost_total = mpc_result.cost_total
+                    obs.fallback_used = False
+                else:
+                    # MPC failed, fallback to ID
+                    self._handle_mpc_failure(obs, mpc_result.reason)
+                    q_ref = q_target  # Fallback to IK target
+                    qd_ref = np.zeros(7)
+            except Exception as e:
+                # MPC exception, fallback to ID
+                self._handle_mpc_failure(obs, f"exception: {str(e)}")
+                q_ref = q_target
+                qd_ref = np.zeros(7)
+        else:
+            # Not using MPC this step
+            obs.controller_mode = "ID_SERVO"
+            if self.mpc_disabled_for_episode:
+                obs.fallback_used = True
+                obs.mpc_failure_reason = "disabled_for_episode"
+        
+        # Compute control (inverse dynamics tracking q_ref, qd_ref)
+        tau = self._inverse_dynamics_control(obs.q, obs.qd, q_ref, qd_ref, decision)
         
         # Apply control
         self.data.ctrl[:7] = tau
@@ -311,6 +413,35 @@ class RFSNHarness:
         self.step_count += 1
         
         return obs
+    
+    def _handle_mpc_failure(self, obs: ObsPacket, reason: str):
+        """Handle MPC solver failure and update tracking."""
+        self.mpc_failures += 1
+        self.mpc_failure_streak += 1
+        
+        # Update obs
+        obs.controller_mode = "ID_SERVO"
+        obs.fallback_used = True
+        obs.mpc_failure_reason = reason
+        obs.mpc_converged = False
+        
+        # Log failure
+        if self.logger:
+            self.logger._log_event('mpc_failure', obs.t, {
+                'reason': reason,
+                'failure_streak': self.mpc_failure_streak
+            })
+        
+        # Disable MPC for episode if too many consecutive failures
+        MAX_MPC_FAILURE_STREAK = 5
+        if self.mpc_failure_streak >= MAX_MPC_FAILURE_STREAK:
+            self.mpc_disabled_for_episode = True
+            print(f"[HARNESS] MPC disabled for episode after {self.mpc_failure_streak} consecutive failures")
+            if self.logger:
+                self.logger._log_event('mpc_disabled_for_episode', obs.t, {
+                    'total_failures': self.mpc_failures,
+                    'failure_streak': self.mpc_failure_streak
+                })
     
     def end_episode(self, success: bool = False, failure_reason: str = None):
         """End current episode and update learning with correct attribution."""
@@ -622,6 +753,7 @@ class RFSNHarness:
         q: np.ndarray,
         qd: np.ndarray,
         q_target: np.ndarray,
+        qd_target: np.ndarray,
         decision: Optional[RFSNDecision]
     ) -> np.ndarray:
         """
@@ -629,15 +761,19 @@ class RFSNHarness:
         
         Uses MuJoCo's mj_inverse to compute required torques for PD control.
         
+        V7 UPDATE: Now accepts qd_target (velocity reference) from MPC.
+        When MPC is enabled, q_target and qd_target come from MPC rollout.
+        When MPC is disabled (ID_SERVO), qd_target is zero (position tracking only).
+        
         Profile Parameter Mapping (EXPLICIT):
         =====================================
         - Q_diag[0:7]  → KP_scale = sqrt(Q_pos / 50.0) → Position stiffness
         - Q_diag[7:14] → KD_scale = sqrt(Q_vel / 10.0) → Velocity damping
-        - R_diag       → NOT USED (future: control effort penalty)
-        - du_penalty   → NOT USED (future: acceleration smoothing)
+        - R_diag       → Used by MPC (v7), not in ID controller
+        - du_penalty   → Used by MPC (v7), not in ID controller
         - max_tau_scale→ DIRECT multiplier on output torques (safety limiter)
         
-        This is NOT MPC despite profile naming. It's gain-scheduled PD control.
+        This is the actuation layer - either tracks IK output (v6) or MPC output (v7).
         """
         # Map profile "Q" parameters to PD gains (EXPLICIT PROXY MAPPING)
         if decision:
@@ -649,24 +785,23 @@ class RFSNHarness:
             kd_scale = np.sqrt(decision.Q_diag[7:14] / 10.0)  # Normalized to base=10
             KD_local = self.KD * kd_scale
             
-            # Note: R_diag and du_penalty are NOT used in current implementation
-            # They exist for potential future extensions (control effort, smoothing)
+            # Note: R_diag and du_penalty NOW USED by MPC (v7)
         else:
             KP_local = self.KP
             KD_local = self.KD
         
-        # PD control law
+        # PD control law with velocity reference (v7)
         q_error = q_target - q
-        dq_desired = KP_local * q_error
+        qd_error = qd_target - qd  # V7: Track velocity reference from MPC
         
         # Create temp data for inverse dynamics
         data_temp = mj.MjData(self.model)
         data_temp.qpos[:] = self.data.qpos
         data_temp.qvel[:] = self.data.qvel
         
-        # Set desired acceleration (PD output)
+        # Set desired acceleration (PD output with velocity reference)
         qacc_full = np.zeros(self.model.nv)
-        qacc_full[:7] = dq_desired - KD_local * qd
+        qacc_full[:7] = KP_local * q_error + KD_local * qd_error  # V7: Track both position and velocity
         data_temp.qacc[:] = qacc_full
         
         # Compute inverse dynamics (maps acceleration to torques)

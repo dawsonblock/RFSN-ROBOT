@@ -77,6 +77,10 @@ class RFSNLogger:
                 'false_lift_count',
                 'grasp_confirmation_time_s',
                 'slip_events',
+                # V7: MPC tracking metrics
+                'mpc_steps_used',
+                'mpc_failure_count',
+                'avg_mpc_solve_time_ms',
             ])
     
     def start_episode(self, episode_id: int, task_name: str, 
@@ -273,6 +277,15 @@ class RFSNLogger:
             if event['event_type'] in ['slip_detected', 'attachment_lost']:
                 slip_events += 1
         
+        # V7: Compute MPC-specific metrics
+        mpc_steps_used = sum(1 for o in obs_history if o.controller_mode == "MPC_TRACKING")
+        mpc_failure_count = sum(1 for o in obs_history if o.fallback_used)
+        
+        # Average MPC solve time (only for steps that used MPC)
+        mpc_solve_times = [o.mpc_solve_time_ms for o in obs_history 
+                          if o.controller_mode == "MPC_TRACKING" and o.mpc_solve_time_ms > 0]
+        avg_mpc_solve_time = sum(mpc_solve_times) / len(mpc_solve_times) if mpc_solve_times else 0.0
+        
         # Write to CSV
         with open(self.episodes_csv_path, 'a', newline='') as f:
             writer = csv.writer(f)
@@ -307,6 +320,10 @@ class RFSNLogger:
                 false_lift_count,
                 grasp_confirmation_time_s,
                 slip_events,
+                # V7: MPC tracking metrics
+                mpc_steps_used,
+                mpc_failure_count,
+                avg_mpc_solve_time,
             ])
         
         # Log episode end event
