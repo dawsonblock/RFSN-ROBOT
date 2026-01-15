@@ -30,7 +30,7 @@ from eval.metrics import compute_metrics, format_metrics, load_episodes, load_ev
 
 def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = False) -> tuple:
     """
-    Run a single episode.
+    Run a single episode with task-aligned success criteria.
     
     Args:
         harness: RFSN harness
@@ -39,14 +39,25 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
         
     Returns:
         (success, failure_reason)
+        
+    Success Criteria (Task-Aligned):
+    - Cube must be in goal region (pick-place) or displaced (pick-throw)
+    - Cube height must be appropriate (on table for place, lifted for throw)
+    - No severe safety violations (collisions, excessive penetration)
+    - Not stuck in repeated RECOVER loops
     """
     harness.start_episode()
     
     # Track initial cube position from actual simulation state
     initial_cube_pos = None
     goal_region_center = np.array([-0.2, 0.3, 0.45])  # Target place location
-    goal_tolerance = 0.15  # 15cm radius around goal
-    min_displacement = 0.10  # Minimum 10cm movement to consider manipulation
+    goal_tolerance = 0.10  # 10cm radius around goal (stricter)
+    min_displacement = 0.15  # Minimum 15cm movement (stricter)
+    
+    # Track safety violations for penalties
+    collision_count = 0
+    excessive_penetration_count = 0
+    recover_state_count = 0
     
     for step in range(max_steps):
         obs = harness.step()
@@ -55,23 +66,45 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
         if step == 0 and obs.x_obj_pos is not None:
             initial_cube_pos = obs.x_obj_pos.copy()
         
+        # Track safety violations
+        if obs.self_collision or obs.table_collision:
+            collision_count += 1
+        if obs.penetration > 0.05:
+            excessive_penetration_count += 1
+        
         # Check terminal conditions for RFSN modes
         if harness.rfsn_enabled:
             current_state = harness.state_machine.current_state
             
-            # Success: completed task and cube in goal region
+            # Track RECOVER loops (penalty for repeated failures)
+            if current_state == "RECOVER":
+                recover_state_count += 1
+                if recover_state_count > 500:  # Stuck in RECOVER
+                    return False, "repeated_recover"
+            
+            # Success: completed task and cube properly placed/displaced
             if current_state == "IDLE" and step > 100:
                 if obs.x_obj_pos is not None and initial_cube_pos is not None:
-                    # Check if cube reached goal region (for pick-place)
+                    # Primary success: cube in goal region with appropriate height
                     distance_to_goal = np.linalg.norm(obs.x_obj_pos[:2] - goal_region_center[:2])
-                    if distance_to_goal < goal_tolerance:
+                    cube_on_table = abs(obs.x_obj_pos[2] - initial_cube_pos[2]) < 0.03  # Within 3cm of table
+                    
+                    if distance_to_goal < goal_tolerance and cube_on_table:
+                        # Check for safety violations during task
+                        if collision_count > 0:
+                            return False, "collision_during_task"
+                        if excessive_penetration_count > 0:
+                            return False, "excessive_penetration"
                         return True, None
                     
-                    # Alternative success: cube was displaced significantly (partial credit)
+                    # Alternative success: cube was displaced and lifted (partial credit)
                     displacement = np.linalg.norm(obs.x_obj_pos[:2] - initial_cube_pos[:2])
                     if displacement > min_displacement:
-                        # Check if cube is lifted
+                        # Check if cube was actually lifted (not just pushed)
                         if obs.x_obj_pos[2] > initial_cube_pos[2] + 0.05:  # Lifted 5cm
+                            # Allow partial success even with minor violations
+                            if collision_count > 5:  # Too many collisions
+                                return False, "excessive_collisions"
                             return True, None
             
             # Failure: reached FAIL state
@@ -83,32 +116,35 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
                 return False, "timeout"
         
         else:
-            # MPC-only mode: check if cube manipulation was successful
-            # Success if cube is stable and displaced from initial position
+            # MPC-only mode: simpler success criteria
+            # Success if cube is displaced from initial position
             if step > 500 and obs.x_obj_pos is not None and initial_cube_pos is not None:
                 displacement = np.linalg.norm(obs.x_obj_pos[:2] - initial_cube_pos[:2])
-                # Note: ObsPacket doesn't include object velocity, so we check EE velocity
-                # as a proxy for system stability
                 ee_vel = np.linalg.norm(obs.xd_ee_lin) if hasattr(obs, 'xd_ee_lin') else 0.0
                 
                 # Check every 100 steps if stable displacement achieved
                 if step % 100 == 0:
                     # Success: cube displaced and system relatively stable
                     if displacement > min_displacement and ee_vel < 0.05:
+                        # Check for safety violations
+                        if collision_count > 5:
+                            return False, "excessive_collisions"
                         return True, None
         
-        # Safety violations (apply to all modes)
+        # Safety violations trigger immediate failure (severity matters)
         if obs.self_collision:
             return False, "self_collision"
-        if obs.table_collision:
+        if obs.table_collision and step > 100:  # Allow initial settling
             return False, "table_collision"
+        if obs.penetration > 0.08:  # Very severe penetration
+            return False, "severe_penetration"
         
         # Episode timeout
         if step >= max_steps - 1:
             # For MPC-only, check final state
             if not harness.rfsn_enabled and obs.x_obj_pos is not None and initial_cube_pos is not None:
                 displacement = np.linalg.norm(obs.x_obj_pos[:2] - initial_cube_pos[:2])
-                if displacement > min_displacement:
+                if displacement > min_displacement and collision_count <= 5:
                     return True, None  # Partial success for MPC baseline
             return False, "max_steps"
     

@@ -30,6 +30,11 @@ def compute_metrics(episodes_df: pd.DataFrame, events: List[dict]) -> Dict:
     """
     Compute evaluation metrics from episodes and events.
     
+    Task-Aligned Metrics:
+    - Success reflects actual task completion (cube placed, not just moved)
+    - Penalties for collisions, penetration, repeated RECOVER
+    - Separate tracking for different failure modes
+    
     Returns:
         Dictionary of metrics
     """
@@ -66,9 +71,29 @@ def compute_metrics(episodes_df: pd.DataFrame, events: List[dict]) -> Dict:
         'mean_steps_per_episode': episodes_df['num_steps'].mean(),
     }
     
-    # Failure reasons
+    # Task-aligned metrics: penalize safety violations
+    # Episodes with collisions
+    episodes_with_collisions = (episodes_df['collision_count'] > 0).sum()
+    # Episodes with excessive penetration (>5 steps with penetration > 0.05m)
+    excessive_penetration_episodes = 0
+    if 'max_penetration' in episodes_df.columns:
+        excessive_penetration_episodes = (episodes_df['max_penetration'] > 0.05).sum()
+    
+    metrics['episodes_with_safety_violations'] = episodes_with_collisions
+    metrics['excessive_penetration_episodes'] = excessive_penetration_episodes
+    
+    # Failure reasons (categorized)
     failure_reasons = episodes_df[~episodes_df['success']]['failure_reason'].value_counts()
     metrics['failure_reasons'] = failure_reasons.to_dict() if len(failure_reasons) > 0 else {}
+    
+    # Count specific failure modes
+    metrics['repeated_recover_failures'] = metrics['failure_reasons'].get('repeated_recover', 0)
+    metrics['collision_failures'] = (
+        metrics['failure_reasons'].get('self_collision', 0) + 
+        metrics['failure_reasons'].get('table_collision', 0) +
+        metrics['failure_reasons'].get('collision_during_task', 0) +
+        metrics['failure_reasons'].get('excessive_collisions', 0)
+    )
     
     # Event counts
     event_counts = {}
@@ -81,19 +106,21 @@ def compute_metrics(episodes_df: pd.DataFrame, events: List[dict]) -> Dict:
 
 
 def format_metrics(metrics: Dict) -> str:
-    """Format metrics as a readable string."""
+    """Format metrics as a readable string with task-aligned focus."""
     lines = []
     lines.append("=" * 70)
-    lines.append("EVALUATION METRICS")
+    lines.append("EVALUATION METRICS (TASK-ALIGNED)")
     lines.append("=" * 70)
     lines.append(f"Total episodes:              {metrics['total_episodes']}")
     lines.append(f"Success rate:                {metrics['success_rate']:.1%}")
     lines.append("")
     
-    lines.append("COLLISIONS:")
+    lines.append("SAFETY VIOLATIONS (TASK PENALTIES):")
     lines.append(f"  Collision rate:            {metrics['collision_rate']:.1%}")
     lines.append(f"  Self-collision rate:       {metrics['self_collision_rate']:.1%}")
     lines.append(f"  Table-collision rate:      {metrics['table_collision_rate']:.1%}")
+    lines.append(f"  Episodes with violations:  {metrics.get('episodes_with_safety_violations', 0)}")
+    lines.append(f"  Excessive penetration:     {metrics.get('excessive_penetration_episodes', 0)}")
     lines.append("")
     
     lines.append("CONSTRAINTS:")
@@ -113,9 +140,19 @@ def format_metrics(metrics: Dict) -> str:
     lines.append("")
     
     if metrics.get('failure_reasons'):
-        lines.append("FAILURE REASONS:")
+        lines.append("FAILURE MODES (CATEGORIZED):")
+        # Group by type
+        collision_failures = metrics.get('collision_failures', 0)
+        recover_failures = metrics.get('repeated_recover_failures', 0)
+        if collision_failures > 0:
+            lines.append(f"  Collision-related:         {collision_failures}")
+        if recover_failures > 0:
+            lines.append(f"  Repeated RECOVER loops:    {recover_failures}")
+        
+        # Show all failure reasons
+        lines.append("  Detailed breakdown:")
         for reason, count in metrics['failure_reasons'].items():
-            lines.append(f"  {reason}: {count}")
+            lines.append(f"    {reason}: {count}")
         lines.append("")
     
     if metrics.get('event_counts'):
