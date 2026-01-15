@@ -592,7 +592,7 @@ class RecedingHorizonMPCQP:
         # Decision variable: z = [x_0, u_0, x_1, u_1, ..., x_{H-1}, u_{H-1}, x_H]
         # State x_t = [q_t (7), qd_t (7)] (14,)
         # Control u_t = qdd_t (7,)
-        # Total decision variables: (H+1)*14 + H*7 = 14*H + 14 + 7*H = 21*H + 14
+        # Total decision variables: (H+1) states + H controls = (H+1)*14 + H*7 = 21*H + 14
         
         n_states = 14  # [q, qd]
         n_controls = 7  # [qdd]
@@ -693,32 +693,13 @@ class RecedingHorizonMPCQP:
                 l_constraint[row_idx] = 0.0
                 u_constraint[row_idx] = 0.0
         
-        # Control bounds (as simple bounds, not constraints)
-        # OSQP allows simple bounds: l <= z <= u
-        l_bounds = -np.inf * np.ones(n_z)
-        u_bounds = np.inf * np.ones(n_z)
-        
-        # Set control bounds for each time step
-        for t in range(H):
-            idx_u = t * (n_states + n_controls) + n_states
-            l_bounds[idx_u:idx_u + n_controls] = self.config.qdd_min
-            u_bounds[idx_u:idx_u + n_controls] = self.config.qdd_max
-        
-        # Combine constraint and bound vectors
-        A_constraint = A_constraint.tocsc()
-        l_combined = np.concatenate([l_constraint, l_bounds])
-        u_combined = np.concatenate([u_constraint, u_bounds])
-        
-        # Actually, OSQP takes A and l, u separately where l <= Az <= u
-        # So we need to stack constraints and bounds properly
-        # Simple bounds are handled by setting appropriate rows in A
-        
-        # Rebuild: Include simple bounds as part of A
-        n_bound_constraints = H * n_controls  # Only bound u_t
+        # Control bounds (as simple bounds within OSQP)
+        # We'll add these as explicit constraint rows in the A matrix
+        n_bound_constraints = H * n_controls
         A_full = sparse.lil_matrix((n_constraints + n_bound_constraints, n_z))
         A_full[:n_constraints, :] = A_constraint
         
-        # Add bound constraints: u_t rows
+        # Add bound constraints: u_t rows (identity constraints for control variables)
         for t in range(H):
             idx_u = t * (n_states + n_controls) + n_states
             constraint_idx = n_constraints + t * n_controls
@@ -759,12 +740,18 @@ class RecedingHorizonMPCQP:
         reason = result.info.status
         
         if not converged:
-            # Fallback: use simple solution
+            # Fallback: use previous solution if available, otherwise zero acceleration
             print(f"[MPC_QP] Warning: QP solver failed with status {reason}")
-            # Return zero acceleration as fallback
-            q_ref_next = q + dt * qd
-            qd_ref_next = qd
-            qdd_cmd_next = np.zeros(7)
+            if self.prev_solution is not None and len(self.prev_solution) >= n_states + n_controls:
+                # Extract first control from previous solution (shifted)
+                qdd_cmd_next = self.prev_solution[n_states:n_states + n_controls]
+                q_ref_next = q + dt * qd
+                qd_ref_next = qd + dt * qdd_cmd_next
+            else:
+                # No previous solution: use zero acceleration
+                q_ref_next = q + dt * qd
+                qd_ref_next = qd
+                qdd_cmd_next = np.zeros(7)
             
             solve_time_ms = (time.perf_counter() - t_start) * 1000.0
             

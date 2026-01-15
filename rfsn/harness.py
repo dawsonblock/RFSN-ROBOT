@@ -512,7 +512,8 @@ class RFSNHarness:
                 
                 # V10: Force gating during PLACE
                 # Reduce stiffness if contact force exceeds threshold
-                force_gate_threshold = 15.0  # Newtons
+                from rfsn.mujoco_utils import GraspValidationConfig
+                force_gate_threshold = GraspValidationConfig.FORCE_GATE_THRESHOLD
                 if obs.cube_table_fN > force_gate_threshold or obs.ee_table_fN > force_gate_threshold:
                     # Reduce downward stiffness to prevent excessive force
                     impedance_config.K_pos[2] = min(impedance_config.K_pos[2], 30.0)

@@ -127,6 +127,10 @@ class GraspValidationConfig:
     GRIPPER_CLOSED_WIDTH = 0.06  # Gripper width threshold for "closed" (meters)
     LOW_VELOCITY_THRESHOLD = 0.1  # EE velocity threshold for "stable" (m/s)
     LIFT_HEIGHT_THRESHOLD = 0.02  # Minimum lift to confirm attachment (meters)
+    
+    # V10: Force extraction proxy parameters
+    CONTACT_STIFFNESS = 10000.0  # N/m - typical contact stiffness for penetration-based force proxy
+    FORCE_GATE_THRESHOLD = 15.0  # N - force threshold for impedance gating during PLACE
 
 
 def init_id_cache(model: mj.MjModel):
@@ -789,9 +793,8 @@ def compute_contact_wrenches(model: mj.MjModel, data: mj.MjData, geom_pairs=None
             if dist < 0:
                 # Approximate force magnitude from penetration depth
                 # This is a rough proxy: F ≈ stiffness * penetration
-                # Using a typical contact stiffness of ~10000 N/m
                 penetration_depth = abs(dist)
-                approx_force_mag = 10000.0 * penetration_depth
+                approx_force_mag = GraspValidationConfig.CONTACT_STIFFNESS * penetration_depth
                 
                 # Contact normal (world frame)
                 contact_frame = contact.frame.reshape(3, 3)
