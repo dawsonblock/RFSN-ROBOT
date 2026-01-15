@@ -91,11 +91,15 @@ class GeomBodyIDs:
     def _collect_panda_geoms(self) -> set:
         """Collect all panda link geom IDs."""
         panda_geoms = set()
+        # Only include geoms whose names clearly indicate Panda robot links
+        panda_geom_prefixes = ("panda_link", "panda_joint")
         for i in range(self.model.ngeom):
             try:
                 name = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_GEOM, i)
-                if name and 'panda' in name.lower():
-                    panda_geoms.add(i)
+                if name:
+                    lower_name = name.lower()
+                    if lower_name.startswith(panda_geom_prefixes):
+                        panda_geoms.add(i)
             except:
                 pass  # Skip invalid geoms
         return panda_geoms
