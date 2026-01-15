@@ -152,9 +152,8 @@ def check_contacts(model: mj.MjModel, data: mj.MjData) -> dict:
     
     result['penetration'] = max_penetration
     
-    # Self-collision check (simplified)
-    # Real implementation would check arm link-to-link contacts
-    result['self_collision'] = False  # Stub for now
+    # Self-collision detection is already handled above (lines 116-120)
+    # DO NOT override it here - safety layer depends on truthful collision signals
     
     return result
 
