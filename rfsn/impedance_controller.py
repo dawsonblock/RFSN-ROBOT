@@ -20,7 +20,7 @@ This is particularly useful for:
 import numpy as np
 import mujoco as mj
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 
 @dataclass
