@@ -421,9 +421,9 @@ class RFSNHarness:
                     # Fallback to IK target
                     self._handle_mpc_failure(obs, f"task_space_{ts_result.reason}")
             except Exception as e:
-                # Task-space MPC exception, fallback to IK
+                # Task-space MPC exception, fallback to IK with proper failure handling
                 print(f"[HARNESS] Task-space MPC exception: {e}")
-                pass
+                self._handle_mpc_failure(obs, f"task_space_exception: {e}")
         
         # V8: Impedance control mode (for contact-rich states)
         use_impedance = self.impedance_enabled and decision is not None
