@@ -182,17 +182,31 @@ class RFSNStateMachine:
                 return "GRASP"
         
         elif self.current_state == "GRASP":
-            # Quality-based transition: require good grasp before lifting
-            # Fallback to time-based if grasp_quality not provided
+            # V6: Enhanced quality-based transition with strict requirements
             if grasp_quality is not None:
                 time_ok = time_in_state > self.min_grasp_time
-                quality_ok = grasp_quality.get('quality', 0.0) >= self.grasp_quality_threshold
-                has_contact = grasp_quality.get('has_contact', False)
                 
-                if time_ok and quality_ok:
+                # V6: ALL conditions must be met for GRASP → LIFT
+                quality_ok = grasp_quality.get('quality', 0.0) >= self.grasp_quality_threshold
+                has_bilateral_contact = grasp_quality.get('bilateral_contact', False)
+                is_attached = grasp_quality.get('is_attached', False)
+                no_slip = not grasp_quality.get('slip_detected', True)
+                contact_persistent = grasp_quality.get('contact_persistent', False)
+                
+                # All conditions must hold
+                if time_ok and quality_ok and has_bilateral_contact and is_attached and no_slip and contact_persistent:
+                    print(f"[RFSN] GRASP confirmed: quality={grasp_quality.get('quality', 0.0):.2f}, "
+                          f"attached={is_attached}, persistent={contact_persistent}")
                     return "LIFT"
-                elif time_in_state > 2.0 and not has_contact:
-                    # No contact after 2s - go to RECOVER
+                
+                # Timeout to RECOVER if grasp can't be confirmed
+                MAX_GRASP_TIME = 3.0  # Maximum time to attempt grasp
+                if time_in_state > MAX_GRASP_TIME:
+                    print(f"[RFSN] GRASP timeout after {time_in_state:.2f}s - going to RECOVER")
+                    return "RECOVER"
+                
+                # Immediate RECOVER if no contact after reasonable time
+                if time_in_state > 2.0 and not grasp_quality.get('has_contact', False):
                     print(f"[RFSN] GRASP failed: no contact after 2s")
                     return "RECOVER"
             else:
@@ -201,6 +215,17 @@ class RFSNStateMachine:
                     return "LIFT"
         
         elif self.current_state == "LIFT":
+            # V6: Continuous slip/attachment monitoring during LIFT
+            if grasp_quality is not None:
+                # Check for attachment loss or slip
+                is_attached = grasp_quality.get('is_attached', False)
+                slip_detected = grasp_quality.get('slip_detected', False)
+                
+                if not is_attached or slip_detected:
+                    print(f"[RFSN] LIFT failed: attachment_lost={not is_attached}, slip={slip_detected}")
+                    return "RECOVER"
+            
+            # Normal lift completion
             if self._at_target(obs.x_ee_pos, self.lift_pos, obs.xd_ee_lin):
                 if self.task_name == "pick_throw":
                     return "THROW_PREP"

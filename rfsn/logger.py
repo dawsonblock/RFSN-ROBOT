@@ -71,6 +71,12 @@ class RFSNLogger:
                 'goal_y',
                 'goal_z',
                 'recover_time_steps',
+                # V6: Grasp validation metrics
+                'grasp_attempts',
+                'grasp_confirmed',
+                'false_lift_count',
+                'grasp_confirmation_time_s',
+                'slip_events',
             ])
     
     def start_episode(self, episode_id: int, task_name: str, 
@@ -221,6 +227,52 @@ class RFSNLogger:
         if decision_history:
             recover_time_steps = sum(1 for d in decision_history if d.task_mode == 'RECOVER')
         
+        # V6: Compute grasp validation metrics
+        grasp_attempts = 0
+        grasp_confirmed = 0
+        false_lift_count = 0
+        grasp_confirmation_time_s = 0.0
+        slip_events = 0
+        
+        # Count grasp attempts (transitions into GRASP state)
+        if decision_history:
+            prev_state = None
+            in_grasp = False
+            grasp_start_time = 0.0
+            lift_started = False
+            lift_start_step = 0
+            
+            for i, decision in enumerate(decision_history):
+                current_state = decision.task_mode
+                
+                # Detect GRASP entry
+                if current_state == 'GRASP' and prev_state != 'GRASP':
+                    grasp_attempts += 1
+                    in_grasp = True
+                    grasp_start_time = obs_history[i].t if i < len(obs_history) else 0.0
+                
+                # Detect successful LIFT after GRASP
+                if current_state == 'LIFT' and prev_state == 'GRASP' and in_grasp:
+                    grasp_confirmed += 1
+                    if i < len(obs_history):
+                        grasp_confirmation_time_s = obs_history[i].t - grasp_start_time
+                    in_grasp = False
+                    lift_started = True
+                    lift_start_step = i
+                
+                # Detect false lift (LIFT → RECOVER within short window)
+                if lift_started and i < lift_start_step + 20:  # Check 20 steps after lift
+                    if current_state == 'RECOVER':
+                        false_lift_count += 1
+                        lift_started = False
+                
+                prev_state = current_state
+        
+        # Count slip events from logged events
+        for event in self.current_episode['events']:
+            if event['event_type'] in ['slip_detected', 'attachment_lost']:
+                slip_events += 1
+        
         # Write to CSV
         with open(self.episodes_csv_path, 'a', newline='') as f:
             writer = csv.writer(f)
@@ -249,6 +301,12 @@ class RFSNLogger:
                 goal_pos[1] if goal_pos else 0.0,
                 goal_pos[2] if goal_pos else 0.0,
                 recover_time_steps,
+                # V6: Grasp validation metrics
+                grasp_attempts,
+                grasp_confirmed,
+                false_lift_count,
+                grasp_confirmation_time_s,
+                slip_events,
             ])
         
         # Log episode end event
