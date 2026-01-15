@@ -53,12 +53,21 @@ class MPCConfig:
     
     def __post_init__(self):
         """Validate configuration."""
+        # Basic scalar checks
         assert self.H_min > 0 and self.H_max >= self.H_min
         assert self.max_iterations > 0
         assert self.time_budget_ms > 0.0
         assert self.learning_rate > 0.0
 
+        # Joint acceleration bounds: shape (7,) and elementwise qdd_min < qdd_max
+        assert isinstance(self.qdd_min, np.ndarray) and isinstance(self.qdd_max, np.ndarray)
+        assert self.qdd_min.shape == (7,) and self.qdd_max.shape == (7,)
+        assert np.all(self.qdd_min < self.qdd_max)
 
+        # Joint velocity bounds: shape (7,) and elementwise qd_min < qd_max
+        assert isinstance(self.qd_min, np.ndarray) and isinstance(self.qd_max, np.ndarray)
+        assert self.qd_min.shape == (7,) and self.qd_max.shape == (7,)
+        assert np.all(self.qd_min < self.qd_max)
 @dataclass
 class MPCResult:
     """Result from MPC solve."""
