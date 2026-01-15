@@ -55,11 +55,12 @@ class ImpedanceConfig:
         if self.K_ori is None:
             self.K_ori = np.array([20.0, 20.0, 20.0])
         if self.D_pos is None:
-            # Critical damping: D = 2 * sqrt(m * K)
-            # Assume effective mass ~2kg
+            # Critical damping formula: D = 2 * sqrt(m * K)
+            # Assuming effective mass ~2kg per axis
             self.D_pos = 2.0 * np.sqrt(2.0 * self.K_pos)
         if self.D_ori is None:
-            # Assume effective inertia ~0.1 kg·m²
+            # Critical damping formula: D = 2 * sqrt(I * K)
+            # Assuming effective inertia ~0.1 kg·m² per axis
             self.D_ori = 2.0 * np.sqrt(0.1 * self.K_ori)
 
 

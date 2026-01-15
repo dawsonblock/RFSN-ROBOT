@@ -218,6 +218,7 @@ class TaskSpaceRecedingHorizonMPC:
         cost_history = []
         converged = False
         reason = "max_iters"
+        grad_norm = 0.0  # Initialize to ensure it's always defined
         
         for iteration in range(self.config.max_iterations):
             # Check time budget
@@ -518,9 +519,10 @@ class TaskSpaceRecedingHorizonMPC:
         grad = np.zeros((H, 7))
         epsilon = 1e-6
         
-        # Base cost
-        _, _, ee_pos_base, ee_quat_base = self._rollout_dynamics(q0, qd0, qdd_trajectory, dt, H)
-        qd_base = np.zeros((H + 1, 7))  # Recompute if needed
+        # Base cost (need full trajectory for accurate gradient)
+        q_base, qd_base, ee_pos_base, ee_quat_base = self._rollout_dynamics(
+            q0, qd0, qdd_trajectory, dt, H
+        )
         base_cost, _ = self._compute_cost(
             ee_pos_base, ee_quat_base, qd_base, qdd_trajectory,
             x_target_pos, x_target_quat,

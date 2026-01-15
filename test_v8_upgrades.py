@@ -459,7 +459,7 @@ def run_all_v8_tests():
         status = "✓ PASS" if result else "✗ FAIL"
         print(f"{status}: {name}")
     
-    print(f"\nTotal: {passed}/{total} tests passed ({100*passed//total}%)")
+    print(f"\nTotal: {passed}/{total} tests passed ({100*passed/total:.0f}%)")
     
     return passed == total
 
