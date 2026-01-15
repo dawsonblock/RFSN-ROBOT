@@ -307,26 +307,28 @@ class ImpedanceController:
             
             if body1 == self.ee_body_id or body2 == self.ee_body_id:
                 # This contact involves EE - read constraint force
-                # MuJoCo stores constraint forces in data.efc_force
-                # Need to map contact to constraint index
+                # MuJoCo contact constraints: For standard friction pyramid,
+                # each contact typically has up to 4 constraint forces:
+                # 1 normal + friction cone (can be 1-3 tangential components)
+                # 
+                # For contacts in efc_force array, we need to find the corresponding
+                # constraint index. This is a simplified approximation that works
+                # for typical manipulation scenarios.
                 
                 # Get contact frame (normal and tangent)
                 contact_frame = contact.frame.reshape(3, 3)  # 3x3 rotation matrix
                 contact_normal = contact_frame[:, 0]  # First column is normal
                 
-                # Read constraint force magnitude from solver
-                # For contacts, forces are stored starting at contact index
-                if i < data.nefc:
-                    # Normal force (first component)
-                    fn = data.efc_force[i * 3] if (i * 3) < len(data.efc_force) else 0.0
-                    # Tangential forces (friction)
-                    ft1 = data.efc_force[i * 3 + 1] if (i * 3 + 1) < len(data.efc_force) else 0.0
-                    ft2 = data.efc_force[i * 3 + 2] if (i * 3 + 2) < len(data.efc_force) else 0.0
+                # Approximate force from contact normal force (stored in constraint solver)
+                # This is a simplified implementation - full implementation would
+                # properly map contact -> constraint indices via efc_J
+                if i < len(data.efc_force) // 3:
+                    # Normal force (dominant component for manipulation)
+                    fn = data.efc_force[i] if i < len(data.efc_force) else 0.0
                     
-                    # Reconstruct force vector in world frame
-                    force = (fn * contact_frame[:, 0] + 
-                            ft1 * contact_frame[:, 1] + 
-                            ft2 * contact_frame[:, 2])
+                    # Simple reconstruction: mainly normal force
+                    # (tangential forces often small compared to normal in manipulation)
+                    force = fn * contact_normal
                     
                     total_force += force
                     

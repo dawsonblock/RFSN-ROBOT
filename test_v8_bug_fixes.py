@@ -106,6 +106,11 @@ def test_no_duplicate_exception_handler():
         # Count exception handlers in MPC section
         mpc_section_start = harness_source.find("# V7: MPC integration")
         mpc_section_end = harness_source.find("# V8: Task-space MPC integration", mpc_section_start)
+        
+        # Validate section markers found
+        if mpc_section_start == -1 or mpc_section_end == -1:
+            raise ValueError("Could not locate MPC section markers in harness.py")
+        
         mpc_section = harness_source[mpc_section_start:mpc_section_end]
         
         # Count "except Exception" occurrences

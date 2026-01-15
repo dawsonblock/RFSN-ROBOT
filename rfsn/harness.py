@@ -405,7 +405,7 @@ class RFSNHarness:
                     qd_ref = np.zeros(7)
             else:
                 # Between replans - use cached MPC reference with ID tracking
-                if self.mpc_cached_q_ref is not None:
+                if self.mpc_cached_q_ref is not None and self.mpc_cached_qd_ref is not None:
                     q_ref = self.mpc_cached_q_ref
                     qd_ref = self.mpc_cached_qd_ref
                     obs.controller_mode = "MPC_TRACKING"
@@ -413,7 +413,7 @@ class RFSNHarness:
                     obs.mpc_solve_time_ms = 0.0  # No solve this step
                     obs.mpc_iters = 0
                 else:
-                    # No cached plan available, use IK
+                    # No valid cached plan available, use IK
                     q_ref = q_target
                     qd_ref = np.zeros(7)
                     obs.controller_mode = "ID_SERVO"
@@ -486,7 +486,7 @@ class RFSNHarness:
                         })
             else:
                 # Between replans - use cached task-space MPC reference
-                if self.task_space_cached_q_ref is not None:
+                if self.task_space_cached_q_ref is not None and self.task_space_cached_qd_ref is not None:
                     q_ref = self.task_space_cached_q_ref
                     qd_ref = self.task_space_cached_qd_ref
                     obs.controller_mode = "TASK_SPACE_MPC"
