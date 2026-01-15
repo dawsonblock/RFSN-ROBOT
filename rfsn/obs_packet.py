@@ -33,6 +33,8 @@ class ObsPacket:
     # Object state (if present)
     x_obj_pos: Optional[np.ndarray] = None  # shape (3,)
     x_obj_quat: Optional[np.ndarray] = None  # shape (4,)
+    xd_obj_lin: Optional[np.ndarray] = None  # shape (3,) - linear velocity
+    xd_obj_ang: Optional[np.ndarray] = None  # shape (3,) - angular velocity
     
     # Goal state (if present)
     x_goal_pos: Optional[np.ndarray] = None  # shape (3,)

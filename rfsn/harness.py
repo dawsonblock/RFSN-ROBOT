@@ -138,6 +138,12 @@ class RFSNHarness:
         self.decision_history = []
         self.initial_cube_z = None  # Track initial cube height for grasp quality
         
+        # V6: Grasp validation history buffer
+        self.grasp_history = None
+        if self.rfsn_enabled:
+            from rfsn.mujoco_utils import GraspHistoryBuffer
+            self.grasp_history = GraspHistoryBuffer(window_size=20)
+        
     def start_episode(self):
         """Start a new episode."""
         self.t = 0.0
@@ -146,6 +152,10 @@ class RFSNHarness:
         self.obs_history = []
         self.decision_history = []
         self.initial_cube_z = None
+        
+        # Reset grasp validation history
+        if self.grasp_history:
+            self.grasp_history.reset()
         
         if self.rfsn_enabled:
             self.state_machine.reset()
@@ -172,6 +182,23 @@ class RFSNHarness:
         if self.initial_cube_z is None and obs.x_obj_pos is not None:
             self.initial_cube_z = obs.x_obj_pos[2]
         
+        # V6: Update grasp validation history buffer
+        if self.grasp_history and obs.x_obj_pos is not None and obs.xd_obj_lin is not None:
+            # Get detailed contact information
+            from rfsn.mujoco_utils import check_detailed_contacts
+            detailed_contacts = check_detailed_contacts(self.model, self.data)
+            
+            # Add observation to history
+            self.grasp_history.add_observation(
+                obj_pos=obs.x_obj_pos,
+                ee_pos=obs.x_ee_pos,
+                obj_vel=obs.xd_obj_lin,
+                ee_vel=obs.xd_ee_lin,
+                has_contact=obs.obj_contact,
+                left_finger_contact=detailed_contacts['left_finger_contact'],
+                right_finger_contact=detailed_contacts['right_finger_contact']
+            )
+        
         # Generate decision
         if self.rfsn_enabled:
             # RFSN mode: state machine generates decision
@@ -183,10 +210,25 @@ class RFSNHarness:
                     safety_poison_check=self.safety_clamp.is_poisoned
                 )
             
-            # Compute grasp quality for GRASP state
+            # V6: Compute enhanced grasp quality for GRASP and LIFT states
             grasp_quality = None
-            if self.state_machine.current_state == "GRASP":
-                grasp_quality = self._check_grasp_quality(obs, self.initial_cube_z)
+            if self.state_machine.current_state in ["GRASP", "LIFT"]:
+                grasp_quality = self._check_grasp_quality_enhanced(obs, self.initial_cube_z)
+                
+                # V6: Log slip and attachment events
+                if self.logger and grasp_quality:
+                    if grasp_quality.get('slip_detected', False):
+                        self.logger._log_event('slip_detected', obs.t, {
+                            'state': self.state_machine.current_state,
+                            'attachment_confidence': grasp_quality.get('attachment_confidence', 0.0)
+                        })
+                    
+                    if self.state_machine.current_state == "LIFT":
+                        if not grasp_quality.get('is_attached', False):
+                            self.logger._log_event('attachment_lost', obs.t, {
+                                'state': self.state_machine.current_state,
+                                'quality': grasp_quality.get('quality', 0.0)
+                            })
             
             decision = self.state_machine.step(obs, profile_override=profile_variant,
                                               grasp_quality=grasp_quality)
@@ -656,10 +698,8 @@ class RFSNHarness:
                 'quality': float - grasp quality score 0-1
             }
         """
-        # Grasp quality thresholds
-        GRIPPER_CLOSED_WIDTH = 0.06  # Gripper width threshold for "closed" (meters)
-        LOW_VELOCITY_THRESHOLD = 0.1  # EE velocity threshold for "stable" (m/s)
-        LIFT_HEIGHT_THRESHOLD = 0.02  # Minimum lift to confirm attachment (meters)
+        from rfsn.mujoco_utils import GraspValidationConfig
+        cfg = GraspValidationConfig
         
         result = {
             'has_contact': obs.obj_contact and obs.ee_contact,
@@ -674,18 +714,18 @@ class RFSNHarness:
         
         # Check gripper width (closed enough)
         gripper_width = obs.gripper.get('width', 0.0)
-        is_closed = gripper_width < GRIPPER_CLOSED_WIDTH
+        is_closed = gripper_width < cfg.GRIPPER_CLOSED_WIDTH
         
         # Check relative motion (EE velocity as proxy for grasp stability)
         # Note: ObsPacket doesn't include object velocity, so we use EE velocity
         # which should be low during stable grasp
         if obs.x_obj_pos is not None:
             ee_vel_norm = np.linalg.norm(obs.xd_ee_lin)
-            is_low_motion = ee_vel_norm < LOW_VELOCITY_THRESHOLD
+            is_low_motion = ee_vel_norm < cfg.LOW_VELOCITY_THRESHOLD
             
             # Check cube attachment: cube should have lifted from initial position
             if initial_cube_z is not None:
-                cube_lifted = obs.x_obj_pos[2] > (initial_cube_z + LIFT_HEIGHT_THRESHOLD)
+                cube_lifted = obs.x_obj_pos[2] > (initial_cube_z + cfg.LIFT_HEIGHT_THRESHOLD)
                 result['is_attached'] = cube_lifted
         else:
             is_low_motion = True
@@ -703,6 +743,106 @@ class RFSNHarness:
             quality += 0.2  # Low velocity
         if result['is_attached']:
             quality += 0.25  # Cube lifted (strong indicator)
+        
+        result['quality'] = quality
+        
+        return result
+    
+    def _check_grasp_quality_enhanced(self, obs: ObsPacket, initial_cube_z: float = None) -> dict:
+        """
+        V6: Enhanced grasp quality check using history buffer and advanced validation.
+        
+        Args:
+            obs: Current observation
+            initial_cube_z: Initial cube height
+        
+        Returns:
+            Enhanced grasp quality dict with attachment, slip, and persistence metrics
+        """
+        from rfsn.mujoco_utils import (
+            check_detailed_contacts,
+            compute_attachment_proxy,
+            detect_slip,
+            check_contact_persistence
+        )
+        
+        # Get detailed contacts
+        detailed_contacts = check_detailed_contacts(self.model, self.data)
+        
+        # Base result
+        result = {
+            'has_contact': obs.obj_contact,
+            'bilateral_contact': detailed_contacts['bilateral_contact'],
+            'is_stable': False,
+            'is_attached': False,
+            'slip_detected': False,
+            'contact_persistent': False,
+            'quality': 0.0,
+            'attachment_confidence': 0.0
+        }
+        
+        from rfsn.mujoco_utils import GraspValidationConfig
+        cfg = GraspValidationConfig
+        
+        # Gripper state checks
+        gripper_width = obs.gripper.get('width', 0.0)
+        is_gripper_closed = gripper_width < cfg.GRIPPER_CLOSED_WIDTH
+        
+        # EE velocity check
+        ee_vel_norm = np.linalg.norm(obs.xd_ee_lin)
+        is_low_velocity = ee_vel_norm < cfg.LOW_VELOCITY_THRESHOLD
+        
+        # If no history buffer or insufficient data, fall back to basic checks
+        if not self.grasp_history or self.grasp_history.get_size() < 5:
+            result['is_stable'] = (is_gripper_closed and is_low_velocity and 
+                                  result['bilateral_contact'])
+            result['quality'] = 0.3 if result['is_stable'] else 0.0
+            return result
+        
+        # Compute attachment proxy from history
+        attachment = compute_attachment_proxy(self.grasp_history, min_steps=10)
+        result['is_attached'] = attachment['is_attached']
+        result['attachment_confidence'] = attachment['confidence']
+        
+        # Detect slip
+        slip = detect_slip(self.grasp_history, min_steps=5)
+        result['slip_detected'] = slip['slip_detected']
+        
+        # Check contact persistence
+        persistence = check_contact_persistence(
+            self.grasp_history,
+            required_steps=5,
+            window_steps=10
+        )
+        result['contact_persistent'] = persistence['bilateral_persistent']
+        
+        # Overall stability requires multiple conditions
+        result['is_stable'] = (
+            is_gripper_closed and
+            is_low_velocity and
+            result['bilateral_contact'] and
+            result['contact_persistent'] and
+            not result['slip_detected']
+        )
+        
+        # Enhanced quality score
+        quality = 0.0
+        
+        # Basic checks (40%)
+        if result['bilateral_contact']:
+            quality += 0.2
+        if is_gripper_closed:
+            quality += 0.1
+        if is_low_velocity:
+            quality += 0.1
+        
+        # Advanced checks (60%)
+        if result['contact_persistent']:
+            quality += 0.15
+        if result['is_attached']:
+            quality += 0.25
+        if not result['slip_detected']:
+            quality += 0.2
         
         result['quality'] = quality
         

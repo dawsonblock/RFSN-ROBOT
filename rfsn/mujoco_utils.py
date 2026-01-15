@@ -61,7 +61,7 @@ class GeomBodyIDs:
         print(f"  Hand geom:       {self.hand_geom_id} (panda_hand_geom)")
         print(f"  Table geom:      {self.table_geom_id} (table_top)")
         print(f"  Panda link geoms: {len(self.panda_link_geoms)} geoms")
-        
+    
     def _resolve_body(self, name: str, description: str) -> int:
         """Resolve body ID with clear error message."""
         try:
@@ -103,6 +103,30 @@ class GeomBodyIDs:
             except Exception:
                 pass  # Skip invalid geoms
         return panda_geoms
+
+
+# V6: Grasp validation thresholds (configurable)
+class GraspValidationConfig:
+    """Configuration parameters for grasp validation thresholds."""
+    
+    # Attachment proxy thresholds
+    ATTACHMENT_POS_STD_THRESHOLD = 0.015  # 1.5cm std in relative position
+    ATTACHMENT_VEL_THRESHOLD = 0.05  # 5cm/s relative velocity
+    ATTACHMENT_HEIGHT_CORR_THRESHOLD = 0.7  # Strong positive correlation
+    
+    # Slip detection thresholds
+    SLIP_VEL_SPIKE_THRESHOLD = 0.15  # 15cm/s velocity spike
+    SLIP_POS_DRIFT_THRESHOLD = 0.02  # 2cm position drift
+    SLIP_CONTACT_DROP_COUNT = 2  # Number of contact drops to trigger
+    
+    # Contact persistence thresholds
+    CONTACT_REQUIRED_STEPS = 5  # Required steps with bilateral contact
+    CONTACT_WINDOW_STEPS = 10  # Window size for persistence check
+    
+    # Gripper state thresholds
+    GRIPPER_CLOSED_WIDTH = 0.06  # Gripper width threshold for "closed" (meters)
+    LOW_VELOCITY_THRESHOLD = 0.1  # EE velocity threshold for "stable" (m/s)
+    LIFT_HEIGHT_THRESHOLD = 0.02  # Minimum lift to confirm attachment (meters)
 
 
 def init_id_cache(model: mj.MjModel):
@@ -181,6 +205,24 @@ def get_object_pose(model: mj.MjModel, data: mj.MjData, obj_name: str = "cube") 
         pos = data.xpos[obj_body_id].copy()
         quat = data.xquat[obj_body_id].copy()
         return pos, quat
+    except:
+        return None, None
+
+
+def get_object_velocity(model: mj.MjModel, data: mj.MjData, obj_name: str = "cube") -> tuple:
+    """
+    Get object velocity (linear and angular).
+    
+    Returns:
+        (lin_vel, ang_vel) or (None, None) if not found
+    """
+    try:
+        obj_body_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, obj_name)
+        if obj_body_id < len(data.cvel):
+            ang_vel = data.cvel[obj_body_id][:3].copy()
+            lin_vel = data.cvel[obj_body_id][3:].copy()
+            return lin_vel, ang_vel
+        return None, None
     except:
         return None, None
 
@@ -354,6 +396,346 @@ def compute_joint_limit_proximity(model: mj.MjModel, data: mj.MjData) -> float:
     return max_prox
 
 
+class GraspHistoryBuffer:
+    """
+    Sliding window buffer for tracking object/EE state history.
+    
+    Used for computing object-follows-EE attachment proxy and slip detection.
+    """
+    
+    def __init__(self, window_size: int = 20):
+        """
+        Initialize history buffer.
+        
+        Args:
+            window_size: Number of steps to track
+        """
+        self.window_size = window_size
+        self.reset()
+    
+    def reset(self):
+        """Clear all history."""
+        self.relative_positions = []  # Δp = p_obj - p_ee
+        self.relative_velocities = []  # v_rel = v_obj - v_ee
+        self.obj_heights = []  # z position of object
+        self.ee_heights = []  # z position of EE
+        self.contact_history = []  # Boolean contact state per step
+        self.left_finger_contacts = []  # Boolean left finger contact
+        self.right_finger_contacts = []  # Boolean right finger contact
+    
+    def add_observation(
+        self,
+        obj_pos: np.ndarray,
+        ee_pos: np.ndarray,
+        obj_vel: np.ndarray,
+        ee_vel: np.ndarray,
+        has_contact: bool,
+        left_finger_contact: bool,
+        right_finger_contact: bool
+    ):
+        """Add a new observation to the history."""
+        # Compute relative state
+        relative_pos = obj_pos - ee_pos
+        relative_vel = obj_vel - ee_vel
+        
+        # Append to buffers
+        self.relative_positions.append(relative_pos)
+        self.relative_velocities.append(relative_vel)
+        self.obj_heights.append(obj_pos[2])
+        self.ee_heights.append(ee_pos[2])
+        self.contact_history.append(has_contact)
+        self.left_finger_contacts.append(left_finger_contact)
+        self.right_finger_contacts.append(right_finger_contact)
+        
+        # Maintain window size
+        if len(self.relative_positions) > self.window_size:
+            self.relative_positions.pop(0)
+            self.relative_velocities.pop(0)
+            self.obj_heights.pop(0)
+            self.ee_heights.pop(0)
+            self.contact_history.pop(0)
+            self.left_finger_contacts.pop(0)
+            self.right_finger_contacts.pop(0)
+    
+    def is_full(self) -> bool:
+        """Check if buffer has reached window size."""
+        return len(self.relative_positions) >= self.window_size
+    
+    def get_size(self) -> int:
+        """Get current buffer size."""
+        return len(self.relative_positions)
+
+
+def check_detailed_contacts(model: mj.MjModel, data: mj.MjData) -> dict:
+    """
+    Enhanced contact checking that tracks individual finger contacts.
+    
+    Returns:
+        {
+            'ee_contact': bool,
+            'obj_contact': bool,
+            'left_finger_contact': bool,
+            'right_finger_contact': bool,
+            'bilateral_contact': bool,
+            'table_collision': bool,
+            'self_collision': bool,
+            'penetration': float
+        }
+    """
+    result = {
+        'ee_contact': False,
+        'obj_contact': False,
+        'left_finger_contact': False,
+        'right_finger_contact': False,
+        'bilateral_contact': False,
+        'table_collision': False,
+        'self_collision': False,
+        'penetration': 0.0
+    }
+    
+    # Use cached IDs
+    ids = get_id_cache()
+    
+    # Check all contacts
+    max_penetration = 0.0
+    
+    for i in range(data.ncon):
+        contact = data.contact[i]
+        g1, g2 = contact.geom1, contact.geom2
+        dist = contact.dist
+        
+        # Self-collision check
+        if g1 in ids.panda_link_geoms and g2 in ids.panda_link_geoms:
+            if dist < -0.001:
+                result['self_collision'] = True
+            continue
+        
+        # Skip cube-table contact
+        if (g1 == ids.cube_geom_id and g2 == ids.table_geom_id) or \
+           (g2 == ids.cube_geom_id and g1 == ids.table_geom_id):
+            continue
+        
+        # Penetration tracking
+        if dist < -0.001:
+            max_penetration = max(max_penetration, abs(dist))
+        
+        # Detailed finger-object contact tracking
+        if g1 == ids.cube_geom_id or g2 == ids.cube_geom_id:
+            other_geom = g2 if g1 == ids.cube_geom_id else g1
+            
+            if other_geom == ids.left_finger_id:
+                result['left_finger_contact'] = True
+                result['obj_contact'] = True
+                result['ee_contact'] = True
+            elif other_geom == ids.right_finger_id:
+                result['right_finger_contact'] = True
+                result['obj_contact'] = True
+                result['ee_contact'] = True
+            elif other_geom == ids.hand_geom_id:
+                result['obj_contact'] = True
+                result['ee_contact'] = True
+        
+        # Table collision (with arm)
+        if g1 == ids.table_geom_id or g2 == ids.table_geom_id:
+            other_geom = g2 if g1 == ids.table_geom_id else g1
+            if other_geom != ids.cube_geom_id and other_geom not in {ids.left_finger_id, ids.right_finger_id, ids.hand_geom_id}:
+                result['table_collision'] = True
+    
+    # Bilateral contact: both fingers touching object
+    result['bilateral_contact'] = result['left_finger_contact'] and result['right_finger_contact']
+    result['penetration'] = max_penetration
+    
+    return result
+
+
+def compute_attachment_proxy(history: GraspHistoryBuffer, min_steps: int = 10) -> dict:
+    """
+    Compute object-follows-EE attachment proxy.
+    
+    Args:
+        history: History buffer with observations
+        min_steps: Minimum steps required for valid computation
+    
+    Returns:
+        {
+            'is_attached': bool - whether object appears attached to EE
+            'confidence': float - confidence score 0-1
+            'relative_pos_std': float - standard deviation of relative position
+            'relative_vel_norm': float - norm of average relative velocity
+            'height_correlation': float - correlation of height changes
+        }
+    """
+    result = {
+        'is_attached': False,
+        'confidence': 0.0,
+        'relative_pos_std': float('inf'),
+        'relative_vel_norm': float('inf'),
+        'height_correlation': 0.0
+    }
+    
+    if history.get_size() < min_steps:
+        return result
+    
+    # Compute std of relative position (should be small if attached)
+    rel_pos_array = np.array(history.relative_positions)
+    rel_pos_std = np.std(rel_pos_array, axis=0)
+    rel_pos_std_norm = np.linalg.norm(rel_pos_std)
+    result['relative_pos_std'] = rel_pos_std_norm
+    
+    # Compute average relative velocity magnitude (should be small if attached)
+    rel_vel_array = np.array(history.relative_velocities)
+    rel_vel_mean = np.mean(rel_vel_array, axis=0)
+    rel_vel_norm = np.linalg.norm(rel_vel_mean)
+    result['relative_vel_norm'] = rel_vel_norm
+    
+    # Compute height correlation (object and EE should move together)
+    obj_heights = np.array(history.obj_heights)
+    ee_heights = np.array(history.ee_heights)
+    # Use configured epsilon to avoid computing correlation when EE height is (nearly) stationary
+    # This prevents numerical issues (e.g., division by zero) in correlation computation.
+    if len(obj_heights) > 1 and np.std(ee_heights) > GraspValidationConfig.HEIGHT_STD_EPSILON:
+        correlation = np.corrcoef(obj_heights, ee_heights)[0, 1]
+        result['height_correlation'] = correlation if not np.isnan(correlation) else 0.0
+    
+    # Attachment thresholds (from config)
+    cfg = GraspValidationConfig
+    # Ensure height std epsilon is available in config; default preserves existing behavior.
+    if not hasattr(cfg, 'HEIGHT_STD_EPSILON'):
+        # HEIGHT_STD_EPSILON prevents correlation computation when EE is stationary.
+        cfg.HEIGHT_STD_EPSILON = 0.001
+    
+    # Determine if attached
+    pos_stable = rel_pos_std_norm < cfg.ATTACHMENT_POS_STD_THRESHOLD
+    vel_small = rel_vel_norm < cfg.ATTACHMENT_VEL_THRESHOLD
+    height_correlated = result['height_correlation'] > cfg.ATTACHMENT_HEIGHT_CORR_THRESHOLD
+    
+    result['is_attached'] = pos_stable and vel_small and height_correlated
+    
+    # Confidence score
+    confidence = 0.0
+    if pos_stable:
+        confidence += 0.4
+    if vel_small:
+        confidence += 0.3
+    if height_correlated:
+        confidence += 0.3
+    result['confidence'] = confidence
+    
+    return result
+
+
+def detect_slip(history: GraspHistoryBuffer, min_steps: int = 5) -> dict:
+    """
+    Detect slip based on sudden changes in relative state.
+    
+    Args:
+        history: History buffer with observations
+        min_steps: Minimum steps required for detection
+    
+    Returns:
+        {
+            'slip_detected': bool - whether slip is detected
+            'vel_spike': bool - sudden velocity spike
+            'pos_drift': bool - rapid position drift
+            'contact_intermittent': bool - intermittent contact loss
+        }
+    """
+    result = {
+        'slip_detected': False,
+        'vel_spike': False,
+        'pos_drift': False,
+        'contact_intermittent': False
+    }
+    
+    if history.get_size() < min_steps:
+        return result
+    
+    # Slip detection thresholds (from config)
+    cfg = GraspValidationConfig
+    
+    # Check velocity spikes (compare recent to baseline)
+    # Use a ratio-based split (approximately last 30% vs earlier 70%),
+    # while enforcing a minimum baseline size to keep statistics meaningful.
+    n_vel = len(history.relative_velocities)
+    # Determine size of the "recent" window: at least 3 steps, ~30% of history
+    recent_window = max(3, int(round(n_vel * 0.3)))
+    # Ensure at least 3 samples remain for the baseline window
+    recent_window = min(recent_window, max(0, n_vel - 3))
+    
+    if recent_window > 0 and (n_vel - recent_window) >= 3:
+        recent_vel = np.array(history.relative_velocities[-recent_window:])  # Recent steps
+        baseline_vel = np.array(history.relative_velocities[:-recent_window])  # Earlier steps
+        
+        if baseline_vel.size >= 3:
+            recent_vel_norm = np.mean([np.linalg.norm(v) for v in recent_vel])
+            baseline_vel_norm = np.mean([np.linalg.norm(v) for v in baseline_vel])
+            
+            if recent_vel_norm > baseline_vel_norm + cfg.SLIP_VEL_SPIKE_THRESHOLD:
+                result['vel_spike'] = True
+    
+    # Check position drift (rapid change in relative position)
+    if history.get_size() >= 5:
+        recent_pos = np.array(history.relative_positions[-5:])
+        pos_change = np.linalg.norm(recent_pos[-1] - recent_pos[0])
+        
+        if pos_change > cfg.SLIP_POS_DRIFT_THRESHOLD:
+            result['pos_drift'] = True
+    
+    # Check intermittent contact (contact drops in recent history)
+    if history.get_size() >= 10:
+        recent_contacts = history.contact_history[-10:]
+        contact_drops = sum(1 for i in range(1, len(recent_contacts)) 
+                          if recent_contacts[i-1] and not recent_contacts[i])
+        
+        if contact_drops >= cfg.SLIP_CONTACT_DROP_COUNT:
+            result['contact_intermittent'] = True
+    
+    # Overall slip detection
+    result['slip_detected'] = (result['vel_spike'] or 
+                              result['pos_drift'] or 
+                              result['contact_intermittent'])
+    
+    return result
+
+
+def check_contact_persistence(history: GraspHistoryBuffer, 
+                              required_steps: int = 5,
+                              window_steps: int = 10) -> dict:
+    """
+    Check if bilateral finger contact has persisted.
+    
+    Args:
+        history: History buffer
+        required_steps: Number of steps with bilateral contact required
+        window_steps: Window size to check
+    
+    Returns:
+        {
+            'bilateral_persistent': bool - bilateral contact for K of last N steps
+            'bilateral_ratio': float - ratio of steps with bilateral contact
+        }
+    """
+    result = {
+        'bilateral_persistent': False,
+        'bilateral_ratio': 0.0
+    }
+    
+    if history.get_size() < window_steps:
+        return result
+    
+    # Check bilateral contact in recent window
+    recent_left = history.left_finger_contacts[-window_steps:]
+    recent_right = history.right_finger_contacts[-window_steps:]
+    
+    bilateral_count = sum(1 for i in range(len(recent_left)) 
+                         if recent_left[i] and recent_right[i])
+    
+    result['bilateral_ratio'] = bilateral_count / window_steps
+    result['bilateral_persistent'] = bilateral_count >= required_steps
+    
+    return result
+
+
 def build_obs_packet(
     model: mj.MjModel,
     data: mj.MjData,
@@ -394,6 +776,7 @@ def build_obs_packet(
     
     # Object
     obj_pos, obj_quat = get_object_pose(model, data, "cube")
+    obj_lin_vel, obj_ang_vel = get_object_velocity(model, data, "cube")
     
     # Contacts
     contacts = check_contacts(model, data)
@@ -413,6 +796,8 @@ def build_obs_packet(
         gripper=gripper,
         x_obj_pos=obj_pos,
         x_obj_quat=obj_quat,
+        xd_obj_lin=obj_lin_vel,
+        xd_obj_ang=obj_ang_vel,
         x_goal_pos=None,  # Set by harness if needed
         x_goal_quat=None,
         ee_contact=contacts['ee_contact'],
