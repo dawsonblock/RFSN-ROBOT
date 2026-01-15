@@ -654,15 +654,24 @@ def detect_slip(history: GraspHistoryBuffer, min_steps: int = 5) -> dict:
     cfg = GraspValidationConfig
     
     # Check velocity spikes (compare recent to baseline)
-    recent_vel = np.array(history.relative_velocities[-3:])  # Last 3 steps
-    baseline_vel = np.array(history.relative_velocities[:-3])  # Earlier steps
+    # Use a ratio-based split (approximately last 30% vs earlier 70%),
+    # while enforcing a minimum baseline size to keep statistics meaningful.
+    n_vel = len(history.relative_velocities)
+    # Determine size of the "recent" window: at least 3 steps, ~30% of history
+    recent_window = max(3, int(round(n_vel * 0.3)))
+    # Ensure at least 3 samples remain for the baseline window
+    recent_window = min(recent_window, max(0, n_vel - 3))
     
-    if len(baseline_vel) > 0:
-        recent_vel_norm = np.mean([np.linalg.norm(v) for v in recent_vel])
-        baseline_vel_norm = np.mean([np.linalg.norm(v) for v in baseline_vel])
+    if recent_window > 0 and (n_vel - recent_window) >= 3:
+        recent_vel = np.array(history.relative_velocities[-recent_window:])  # Recent steps
+        baseline_vel = np.array(history.relative_velocities[:-recent_window])  # Earlier steps
         
-        if recent_vel_norm > baseline_vel_norm + cfg.SLIP_VEL_SPIKE_THRESHOLD:
-            result['vel_spike'] = True
+        if baseline_vel.size >= 3:
+            recent_vel_norm = np.mean([np.linalg.norm(v) for v in recent_vel])
+            baseline_vel_norm = np.mean([np.linalg.norm(v) for v in baseline_vel])
+            
+            if recent_vel_norm > baseline_vel_norm + cfg.SLIP_VEL_SPIKE_THRESHOLD:
+                result['vel_spike'] = True
     
     # Check position drift (rapid change in relative position)
     if history.get_size() >= 5:
