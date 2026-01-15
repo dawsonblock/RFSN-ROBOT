@@ -488,7 +488,7 @@ class TaskSpaceRecedingHorizonMPC:
         # Quaternion multiplication
         w1, x1, y1, z1 = q2
         w2, x2, y2, z2 = q1_conj
-        
+        # Convert to axis-angle using the quaternion logarithm map
         q_error = np.array([
             w1*w2 - x1*x2 - y1*y2 - z1*z2,
             w1*x2 + x1*w2 + y1*z2 - z1*y2,
