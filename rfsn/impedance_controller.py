@@ -224,23 +224,34 @@ class ImpedanceController:
         Returns:
             axis-angle error (3,)
         """
-        # Normalize
-        q_current = q_current / np.linalg.norm(q_current)
-        q_target = q_target / np.linalg.norm(q_target)
-        
-        # Quaternion difference
-        q_current_conj = np.array([q_current[0], -q_current[1], -q_current[2], -q_current[3]])
-        
-        w1, x1, y1, z1 = q_target
-        w2, x2, y2, z2 = q_current_conj
-        
-        q_error = np.array([
-            w1*w2 - x1*x2 - y1*y2 - z1*z2,
-            w1*x2 + x1*w2 + y1*z2 - z1*y2,
-            w1*y2 - x1*z2 + y1*w2 + z1*x2,
-            w1*z2 + x1*y2 - y1*x2 + z1*w2
-        ])
-        
+    
+            # Quaternion difference: q_error = q_target * q_current_conj
+            q_current_conj = np.array([q_current[0], -q_current[1], -q_current[2], -q_current[3]])
+    
+            w1, x1, y1, z1 = q_target
+            w2, x2, y2, z2 = q_current_conj
+    
+            q_error = np.array([
+                w1*w2 - x1*x2 - y1*y2 - z1*z2,
+                w1*x2 + x1*w2 + y1*z2 - z1*y2,
+                w1*y2 - x1*z2 + y1*w2 + z1*x2,
+                w1*z2 + x1*y2 - y1*x2 + z1*w2
+            ])
+    
+            # Ensure scalar part is within [-1, 1] to avoid domain errors
+            q_error[0] = np.clip(q_error[0], -1.0, 1.0)
+
+            # Convert to axis-angle
+            angle = 2 * np.arccos(q_error[0])
+            sin_half_angle = np.sqrt(1.0 - q_error[0]**2)
+
+            if sin_half_angle > 1e-7:
+                axis = q_error[1:4] / sin_half_angle
+                axis_angle = axis * angle
+            else:
+                # Small angle approximation
+                axis_angle = 2.0 * q_error[1:4]
+    
         # Axis-angle
         axis_angle = 2.0 * q_error[1:4]
         
