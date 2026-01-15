@@ -64,9 +64,17 @@ class RFSNLogger:
                 'energy_proxy',
                 'smoothness_proxy',
                 'final_distance_to_goal',
+                'initial_cube_x',
+                'initial_cube_y',
+                'initial_cube_z',
+                'goal_x',
+                'goal_y',
+                'goal_z',
+                'recover_time_steps',
             ])
     
-    def start_episode(self, episode_id: int, task_name: str):
+    def start_episode(self, episode_id: int, task_name: str, 
+                     initial_cube_pos: list = None, goal_pos: list = None):
         """Start logging a new episode."""
         self.current_episode = {
             'episode_id': episode_id,
@@ -75,6 +83,8 @@ class RFSNLogger:
             'obs_history': [],
             'decision_history': [],
             'events': [],
+            'initial_cube_pos': initial_cube_pos,
+            'goal_pos': goal_pos,
         }
         self.episode_count += 1
     
@@ -164,6 +174,16 @@ class RFSNLogger:
         else:
             final_distance = 0.0
         
+        # Extract initial cube and goal positions
+        initial_cube_pos = self.current_episode.get('initial_cube_pos')
+        goal_pos = self.current_episode.get('goal_pos')
+        
+        # Count RECOVER time
+        recover_time_steps = 0
+        for event in self.current_episode['events']:
+            if event['event_type'] == 'state_change' and event.get('data', {}).get('new_state') == 'RECOVER':
+                recover_time_steps += 1
+        
         # Write to CSV
         with open(self.episodes_csv_path, 'a', newline='') as f:
             writer = csv.writer(f)
@@ -185,6 +205,13 @@ class RFSNLogger:
                 energy_proxy,
                 smoothness_proxy,
                 final_distance,
+                initial_cube_pos[0] if initial_cube_pos else 0.0,
+                initial_cube_pos[1] if initial_cube_pos else 0.0,
+                initial_cube_pos[2] if initial_cube_pos else 0.0,
+                goal_pos[0] if goal_pos else 0.0,
+                goal_pos[1] if goal_pos else 0.0,
+                goal_pos[2] if goal_pos else 0.0,
+                recover_time_steps,
             ])
         
         # Log episode end event
