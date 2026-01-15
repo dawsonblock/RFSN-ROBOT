@@ -698,10 +698,8 @@ class RFSNHarness:
                 'quality': float - grasp quality score 0-1
             }
         """
-        # Grasp quality thresholds
-        GRIPPER_CLOSED_WIDTH = 0.06  # Gripper width threshold for "closed" (meters)
-        LOW_VELOCITY_THRESHOLD = 0.1  # EE velocity threshold for "stable" (m/s)
-        LIFT_HEIGHT_THRESHOLD = 0.02  # Minimum lift to confirm attachment (meters)
+        from rfsn.mujoco_utils import GraspValidationConfig
+        cfg = GraspValidationConfig
         
         result = {
             'has_contact': obs.obj_contact and obs.ee_contact,
@@ -716,18 +714,18 @@ class RFSNHarness:
         
         # Check gripper width (closed enough)
         gripper_width = obs.gripper.get('width', 0.0)
-        is_closed = gripper_width < GRIPPER_CLOSED_WIDTH
+        is_closed = gripper_width < cfg.GRIPPER_CLOSED_WIDTH
         
         # Check relative motion (EE velocity as proxy for grasp stability)
         # Note: ObsPacket doesn't include object velocity, so we use EE velocity
         # which should be low during stable grasp
         if obs.x_obj_pos is not None:
             ee_vel_norm = np.linalg.norm(obs.xd_ee_lin)
-            is_low_motion = ee_vel_norm < LOW_VELOCITY_THRESHOLD
+            is_low_motion = ee_vel_norm < cfg.LOW_VELOCITY_THRESHOLD
             
             # Check cube attachment: cube should have lifted from initial position
             if initial_cube_z is not None:
-                cube_lifted = obs.x_obj_pos[2] > (initial_cube_z + LIFT_HEIGHT_THRESHOLD)
+                cube_lifted = obs.x_obj_pos[2] > (initial_cube_z + cfg.LIFT_HEIGHT_THRESHOLD)
                 result['is_attached'] = cube_lifted
         else:
             is_low_motion = True
@@ -783,15 +781,16 @@ class RFSNHarness:
             'attachment_confidence': 0.0
         }
         
+        from rfsn.mujoco_utils import GraspValidationConfig
+        cfg = GraspValidationConfig
+        
         # Gripper state checks
         gripper_width = obs.gripper.get('width', 0.0)
-        GRIPPER_CLOSED_WIDTH = 0.06
-        is_gripper_closed = gripper_width < GRIPPER_CLOSED_WIDTH
+        is_gripper_closed = gripper_width < cfg.GRIPPER_CLOSED_WIDTH
         
         # EE velocity check
         ee_vel_norm = np.linalg.norm(obs.xd_ee_lin)
-        LOW_VELOCITY_THRESHOLD = 0.1
-        is_low_velocity = ee_vel_norm < LOW_VELOCITY_THRESHOLD
+        is_low_velocity = ee_vel_norm < cfg.LOW_VELOCITY_THRESHOLD
         
         # If no history buffer or insufficient data, fall back to basic checks
         if not self.grasp_history or self.grasp_history.get_size() < 5:

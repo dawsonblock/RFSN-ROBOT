@@ -212,8 +212,8 @@ class RFSNStateMachine:
                         return "LIFT"
                 
                 # Timeout to RECOVER if grasp can't be confirmed
-                MAX_GRASP_TIME = 3.0  # Maximum time to attempt grasp
-                if time_in_state > MAX_GRASP_TIME:
+                # V6: Maximum time to attempt grasp (configurable)
+                if time_in_state > self.state_timeouts.get("GRASP", 3.0):
                     print(f"[RFSN] GRASP timeout after {time_in_state:.2f}s - going to RECOVER")
                     return "RECOVER"
                 

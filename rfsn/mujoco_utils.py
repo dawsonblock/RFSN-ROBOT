@@ -61,7 +61,7 @@ class GeomBodyIDs:
         print(f"  Hand geom:       {self.hand_geom_id} (panda_hand_geom)")
         print(f"  Table geom:      {self.table_geom_id} (table_top)")
         print(f"  Panda link geoms: {len(self.panda_link_geoms)} geoms")
-        
+    
     def _resolve_body(self, name: str, description: str) -> int:
         """Resolve body ID with clear error message."""
         try:
@@ -103,6 +103,30 @@ class GeomBodyIDs:
             except Exception:
                 pass  # Skip invalid geoms
         return panda_geoms
+
+
+# V6: Grasp validation thresholds (configurable)
+class GraspValidationConfig:
+    """Configuration parameters for grasp validation thresholds."""
+    
+    # Attachment proxy thresholds
+    ATTACHMENT_POS_STD_THRESHOLD = 0.015  # 1.5cm std in relative position
+    ATTACHMENT_VEL_THRESHOLD = 0.05  # 5cm/s relative velocity
+    ATTACHMENT_HEIGHT_CORR_THRESHOLD = 0.7  # Strong positive correlation
+    
+    # Slip detection thresholds
+    SLIP_VEL_SPIKE_THRESHOLD = 0.15  # 15cm/s velocity spike
+    SLIP_POS_DRIFT_THRESHOLD = 0.02  # 2cm position drift
+    SLIP_CONTACT_DROP_COUNT = 2  # Number of contact drops to trigger
+    
+    # Contact persistence thresholds
+    CONTACT_REQUIRED_STEPS = 5  # Required steps with bilateral contact
+    CONTACT_WINDOW_STEPS = 10  # Window size for persistence check
+    
+    # Gripper state thresholds
+    GRIPPER_CLOSED_WIDTH = 0.06  # Gripper width threshold for "closed" (meters)
+    LOW_VELOCITY_THRESHOLD = 0.1  # EE velocity threshold for "stable" (m/s)
+    LIFT_HEIGHT_THRESHOLD = 0.02  # Minimum lift to confirm attachment (meters)
 
 
 def init_id_cache(model: mj.MjModel):
@@ -571,15 +595,13 @@ def compute_attachment_proxy(history: GraspHistoryBuffer, min_steps: int = 10) -
         correlation = np.corrcoef(obj_heights, ee_heights)[0, 1]
         result['height_correlation'] = correlation if not np.isnan(correlation) else 0.0
     
-    # Attachment thresholds
-    POS_STD_THRESHOLD = 0.015  # 1.5cm std in relative position
-    VEL_THRESHOLD = 0.05  # 5cm/s relative velocity
-    HEIGHT_CORR_THRESHOLD = 0.7  # Strong positive correlation
+    # Attachment thresholds (from config)
+    cfg = GraspValidationConfig
     
     # Determine if attached
-    pos_stable = rel_pos_std_norm < POS_STD_THRESHOLD
-    vel_small = rel_vel_norm < VEL_THRESHOLD
-    height_correlated = result['height_correlation'] > HEIGHT_CORR_THRESHOLD
+    pos_stable = rel_pos_std_norm < cfg.ATTACHMENT_POS_STD_THRESHOLD
+    vel_small = rel_vel_norm < cfg.ATTACHMENT_VEL_THRESHOLD
+    height_correlated = result['height_correlation'] > cfg.ATTACHMENT_HEIGHT_CORR_THRESHOLD
     
     result['is_attached'] = pos_stable and vel_small and height_correlated
     
@@ -622,8 +644,10 @@ def detect_slip(history: GraspHistoryBuffer, min_steps: int = 5) -> dict:
     if history.get_size() < min_steps:
         return result
     
+    # Slip detection thresholds (from config)
+    cfg = GraspValidationConfig
+    
     # Check velocity spikes (compare recent to baseline)
-    VEL_SPIKE_THRESHOLD = 0.15  # 15cm/s spike
     recent_vel = np.array(history.relative_velocities[-3:])  # Last 3 steps
     baseline_vel = np.array(history.relative_velocities[:-3])  # Earlier steps
     
@@ -631,16 +655,15 @@ def detect_slip(history: GraspHistoryBuffer, min_steps: int = 5) -> dict:
         recent_vel_norm = np.mean([np.linalg.norm(v) for v in recent_vel])
         baseline_vel_norm = np.mean([np.linalg.norm(v) for v in baseline_vel])
         
-        if recent_vel_norm > baseline_vel_norm + VEL_SPIKE_THRESHOLD:
+        if recent_vel_norm > baseline_vel_norm + cfg.SLIP_VEL_SPIKE_THRESHOLD:
             result['vel_spike'] = True
     
     # Check position drift (rapid change in relative position)
-    POS_DRIFT_THRESHOLD = 0.02  # 2cm drift in short window
     if history.get_size() >= 5:
         recent_pos = np.array(history.relative_positions[-5:])
         pos_change = np.linalg.norm(recent_pos[-1] - recent_pos[0])
         
-        if pos_change > POS_DRIFT_THRESHOLD:
+        if pos_change > cfg.SLIP_POS_DRIFT_THRESHOLD:
             result['pos_drift'] = True
     
     # Check intermittent contact (contact drops in recent history)
@@ -649,7 +672,7 @@ def detect_slip(history: GraspHistoryBuffer, min_steps: int = 5) -> dict:
         contact_drops = sum(1 for i in range(1, len(recent_contacts)) 
                           if recent_contacts[i-1] and not recent_contacts[i])
         
-        if contact_drops >= 2:  # 2 or more contact losses
+        if contact_drops >= cfg.SLIP_CONTACT_DROP_COUNT:
             result['contact_intermittent'] = True
     
     # Overall slip detection
