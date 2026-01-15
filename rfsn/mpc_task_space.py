@@ -426,9 +426,10 @@ class TaskSpaceRecedingHorizonMPC:
         cost_velocity = 0.0
         avg_lin_vel_weight = np.mean(Q_vel[:3])
         avg_ang_vel_weight = np.mean(Q_vel[3:6])
+        n_joints = 7  # Panda arm DOF
         for t in range(H):
             # Penalize joint velocity scaled by average task-space velocity weights
-            cost_velocity += (avg_lin_vel_weight + avg_ang_vel_weight) * np.sum(qd_traj[t, :]**2) / 7.0
+            cost_velocity += (avg_lin_vel_weight + avg_ang_vel_weight) * np.sum(qd_traj[t, :]**2) / n_joints
         
         # Effort cost
         cost_effort = np.sum(R * qdd_trajectory**2)
