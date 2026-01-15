@@ -3,26 +3,49 @@ Profile Library: Safe parameter profiles per state
 ===================================================
 Defines 3-5 variants per state (base, precise, smooth, fast, stable).
 
-CRITICAL: Parameter Mapping to Actual Control
-==============================================
-Despite "MPC" naming, these parameters map to PD control + IK settings:
+V7 UPDATE: Real MPC Parameter Mapping
+======================================
+In v7, these parameters now control ACTUAL MPC behavior when controller_mode=MPC_TRACKING:
 
-- horizon_steps:    PROXY for IK iteration count (higher = more precise IK)
-- Q_diag[0:7]:      PROXY for KP gains (position stiffness)
-                    KP_scale = sqrt(Q_pos / 50.0)
-- Q_diag[7:14]:     PROXY for KD gains (velocity damping)
-                    KD_scale = sqrt(Q_vel / 10.0)
-- R_diag:           NOT USED (reserved for control effort penalty)
-- du_penalty:       NOT USED (reserved for smoothing/rate limiting)
+- horizon_steps:    MPC prediction horizon (5-30 steps)
+                    Longer horizon = more foresight but slower solve
+                    ALSO used as IK iteration count in ID_SERVO mode
+
+- Q_diag[0:7]:      MPC position tracking weights (state cost)
+                    Higher Q = tighter position tracking
+                    ALSO maps to KP gains in ID_SERVO: KP_scale = sqrt(Q_pos / 50.0)
+
+- Q_diag[7:14]:     MPC velocity penalty weights
+                    Higher Q_vel = penalize motion (useful near contact)
+                    ALSO maps to KD gains in ID_SERVO: KD_scale = sqrt(Q_vel / 10.0)
+
+- R_diag:           MPC control effort penalty (acceleration cost)
+                    Higher R = smoother, lower acceleration
+                    NOW USED by MPC optimizer (was unused in v6)
+
+- du_penalty:       MPC smoothness penalty (jerk/rate limiting)
+                    Higher du = penalize acceleration changes
+                    NOW USED by MPC optimizer (was unused in v6)
+
+- terminal_Q_diag:  MPC terminal cost weights
+                    Higher terminal = stronger pull toward target at horizon end
+
 - max_tau_scale:    DIRECT torque multiplier (≤1.0 for safety)
+                    Applies to ID controller output torques
+
 - contact_policy:   Semantic hint (not enforced in control)
 
-Profile Variant Design Intent:
-- base:      Balanced gains, moderate speed
-- precise:   High Q (stiff), longer horizon (more IK iterations)
-- smooth:    High R (damped), lower tau_scale (gentle)
-- fast:      Short horizon, low R (responsive), high tau_scale
-- stable:    Low Q (compliant), high R (damped), low tau_scale
+Profile Variant Design Intent (V7):
+- base:      Balanced horizon, moderate Q/R, moderate du
+- precise:   Longer horizon, higher Q, lower R (tight tracking)
+- smooth:    Medium horizon, moderate Q, higher R & du (gentle motion)
+- fast:      Short horizon, moderate Q, lower R & du (responsive)
+- stable:    Medium horizon, lower Q, higher R & du (conservative)
+
+State-Specific Tuning (V7):
+- REACH/TRANSPORT: Longer horizons (15-20), moderate R, moderate du
+- GRASP/PLACE: Shorter horizons (8-12), higher du, more velocity penalty
+- RECOVER: Short horizon (5-8), high R, conservative accel bounds
 
 Learning selects variants via UCB to optimize task performance.
 """
@@ -91,51 +114,51 @@ class ProfileLibrary:
         profiles["REACH_PREGRASP"] = {
             "base": MPCProfile(
                 name="reach_pregrasp_base",
-                horizon_steps=15,
+                horizon_steps=18,  # V7: Longer horizon for reaching
                 Q_diag=np.array([100.0] * 7 + [20.0] * 7),
-                R_diag=0.01 * np.ones(7),
+                R_diag=0.015 * np.ones(7),  # V7: Moderate effort penalty
                 terminal_Q_diag=np.array([200.0] * 7 + [40.0] * 7),
-                du_penalty=0.01,
+                du_penalty=0.02,  # V7: Moderate smoothness
                 max_tau_scale=0.8,
                 contact_policy="AVOID"
             ),
             "precise": MPCProfile(
                 name="reach_pregrasp_precise",
-                horizon_steps=20,
+                horizon_steps=25,  # V7: Longer horizon for precision
                 Q_diag=np.array([200.0] * 7 + [30.0] * 7),  # Higher tracking
-                R_diag=0.01 * np.ones(7),
+                R_diag=0.01 * np.ones(7),  # V7: Lower R for tighter control
                 terminal_Q_diag=np.array([400.0] * 7 + [60.0] * 7),
-                du_penalty=0.01,
+                du_penalty=0.015,  # V7: Less smoothing for precision
                 max_tau_scale=0.8,
                 contact_policy="AVOID"
             ),
             "smooth": MPCProfile(
                 name="reach_pregrasp_smooth",
-                horizon_steps=15,
+                horizon_steps=20,  # V7: Medium horizon
                 Q_diag=np.array([80.0] * 7 + [15.0] * 7),
-                R_diag=0.05 * np.ones(7),  # Higher R
+                R_diag=0.04 * np.ones(7),  # V7: Higher R for smoothness
                 terminal_Q_diag=np.array([160.0] * 7 + [30.0] * 7),
-                du_penalty=0.05,  # Higher du penalty
+                du_penalty=0.06,  # V7: High smoothness penalty
                 max_tau_scale=0.7,
                 contact_policy="AVOID"
             ),
             "fast": MPCProfile(
                 name="reach_pregrasp_fast",
-                horizon_steps=8,  # Shorter horizon
+                horizon_steps=12,  # V7: Shorter horizon for responsiveness
                 Q_diag=np.array([120.0] * 7 + [25.0] * 7),
-                R_diag=0.005 * np.ones(7),  # Lower R for responsiveness
+                R_diag=0.008 * np.ones(7),  # V7: Lower R for speed
                 terminal_Q_diag=np.array([240.0] * 7 + [50.0] * 7),
-                du_penalty=0.005,
+                du_penalty=0.01,  # V7: Lower smoothing for speed
                 max_tau_scale=0.9,
                 contact_policy="AVOID"
             ),
             "stable": MPCProfile(
                 name="reach_pregrasp_stable",
-                horizon_steps=12,
+                horizon_steps=15,  # V7: Medium horizon
                 Q_diag=np.array([60.0] * 7 + [12.0] * 7),  # Lower gains
-                R_diag=0.02 * np.ones(7),
+                R_diag=0.03 * np.ones(7),  # V7: Higher R for stability
                 terminal_Q_diag=np.array([120.0] * 7 + [24.0] * 7),
-                du_penalty=0.02,
+                du_penalty=0.04,  # V7: Higher smoothness for stability
                 max_tau_scale=0.6,  # Very conservative
                 contact_policy="AVOID"
             ),
@@ -179,21 +202,21 @@ class ProfileLibrary:
         profiles["GRASP"] = {
             "base": MPCProfile(
                 name="grasp_base",
-                horizon_steps=10,
-                Q_diag=np.array([150.0] * 7 + [30.0] * 7),  # Hold position tight
-                R_diag=0.02 * np.ones(7),
+                horizon_steps=10,  # V7: Short horizon for contact state
+                Q_diag=np.array([150.0] * 7 + [40.0] * 7),  # V7: Higher velocity penalty near contact
+                R_diag=0.025 * np.ones(7),  # V7: Higher R for gentle contact
                 terminal_Q_diag=np.array([300.0] * 7 + [60.0] * 7),
-                du_penalty=0.02,
+                du_penalty=0.05,  # V7: High smoothness near contact
                 max_tau_scale=0.6,
                 contact_policy="ALLOW_EE"
             ),
             "stable": MPCProfile(
                 name="grasp_stable",
-                horizon_steps=10,
-                Q_diag=np.array([100.0] * 7 + [20.0] * 7),
-                R_diag=0.03 * np.ones(7),
+                horizon_steps=8,  # V7: Very short horizon
+                Q_diag=np.array([100.0] * 7 + [30.0] * 7),  # V7: Higher velocity penalty
+                R_diag=0.04 * np.ones(7),  # V7: High R for stability
                 terminal_Q_diag=np.array([200.0] * 7 + [40.0] * 7),
-                du_penalty=0.03,
+                du_penalty=0.08,  # V7: Very high smoothness
                 max_tau_scale=0.5,
                 contact_policy="ALLOW_EE"
             ),
@@ -271,21 +294,21 @@ class ProfileLibrary:
         profiles["PLACE"] = {
             "base": MPCProfile(
                 name="place_base",
-                horizon_steps=12,
-                Q_diag=np.array([120.0] * 7 + [24.0] * 7),
-                R_diag=0.02 * np.ones(7),
+                horizon_steps=10,  # V7: Short horizon for contact
+                Q_diag=np.array([120.0] * 7 + [35.0] * 7),  # V7: Higher velocity penalty
+                R_diag=0.03 * np.ones(7),  # V7: Higher R for gentle placement
                 terminal_Q_diag=np.array([240.0] * 7 + [48.0] * 7),
-                du_penalty=0.02,
+                du_penalty=0.06,  # V7: High smoothness for placement
                 max_tau_scale=0.7,
                 contact_policy="ALLOW_PUSH"
             ),
             "smooth": MPCProfile(
                 name="place_smooth",
-                horizon_steps=15,
-                Q_diag=np.array([100.0] * 7 + [20.0] * 7),
-                R_diag=0.04 * np.ones(7),
+                horizon_steps=12,  # V7: Slightly longer for smoothness
+                Q_diag=np.array([100.0] * 7 + [30.0] * 7),  # V7: Velocity penalty
+                R_diag=0.05 * np.ones(7),  # V7: High R for smooth placement
                 terminal_Q_diag=np.array([200.0] * 7 + [40.0] * 7),
-                du_penalty=0.04,
+                du_penalty=0.08,  # V7: Very high smoothness
                 max_tau_scale=0.6,
                 contact_policy="ALLOW_PUSH"
             ),
@@ -353,11 +376,11 @@ class ProfileLibrary:
         profiles["RECOVER"] = {
             "base": MPCProfile(
                 name="recover_base",
-                horizon_steps=10,
-                Q_diag=np.array([60.0] * 7 + [12.0] * 7),  # Low gains
-                R_diag=0.05 * np.ones(7),  # High damping
+                horizon_steps=8,  # V7: Short horizon for quick response
+                Q_diag=np.array([60.0] * 7 + [15.0] * 7),  # V7: Moderate gains
+                R_diag=0.08 * np.ones(7),  # V7: High R for conservative motion
                 terminal_Q_diag=np.array([120.0] * 7 + [24.0] * 7),
-                du_penalty=0.05,
+                du_penalty=0.1,  # V7: Very high smoothness for safety
                 max_tau_scale=0.4,  # Very conservative
                 contact_policy="AVOID"
             ),
