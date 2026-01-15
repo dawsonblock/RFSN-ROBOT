@@ -347,9 +347,6 @@ class RFSNHarness:
         # PROXY: Use horizon_steps as max IK iterations (clamped for safety)
         # More iterations = more precise convergence = "longer planning horizon" metaphor
         max_iterations = min(max(decision.horizon_steps, 5), 20)  # Clamp to [5, 20]
-        # PROXY: Use horizon_steps as max IK iterations (clamped for safety)
-        # More iterations = more precise convergence = "longer planning horizon" metaphor
-        max_iterations = min(max(decision.horizon_steps, 5), 20)  # Clamp to [5, 20]
         
         pos_tolerance = 0.01  # 1cm
         ori_tolerance = 0.1   # Quaternion distance tolerance
@@ -542,6 +539,11 @@ class RFSNHarness:
                 'quality': float - grasp quality score 0-1
             }
         """
+        # Grasp quality thresholds
+        GRIPPER_CLOSED_WIDTH = 0.06  # Gripper width threshold for "closed" (meters)
+        LOW_VELOCITY_THRESHOLD = 0.1  # EE velocity threshold for "stable" (m/s)
+        LIFT_HEIGHT_THRESHOLD = 0.02  # Minimum lift to confirm attachment (meters)
+        
         result = {
             'has_contact': obs.obj_contact and obs.ee_contact,
             'is_stable': False,
@@ -555,18 +557,18 @@ class RFSNHarness:
         
         # Check gripper width (closed enough)
         gripper_width = obs.gripper.get('width', 0.0)
-        is_closed = gripper_width < 0.06  # Gripper should be mostly closed
+        is_closed = gripper_width < GRIPPER_CLOSED_WIDTH
         
         # Check relative motion (EE velocity as proxy for grasp stability)
         # Note: ObsPacket doesn't include object velocity, so we use EE velocity
         # which should be low during stable grasp
         if obs.x_obj_pos is not None:
             ee_vel_norm = np.linalg.norm(obs.xd_ee_lin)
-            is_low_motion = ee_vel_norm < 0.1  # Less than 10cm/s
+            is_low_motion = ee_vel_norm < LOW_VELOCITY_THRESHOLD
             
             # Check cube attachment: cube should have lifted from initial position
             if initial_cube_z is not None:
-                cube_lifted = obs.x_obj_pos[2] > (initial_cube_z + 0.02)  # Lifted 2cm
+                cube_lifted = obs.x_obj_pos[2] > (initial_cube_z + LIFT_HEIGHT_THRESHOLD)
                 result['is_attached'] = cube_lifted
         else:
             is_low_motion = True

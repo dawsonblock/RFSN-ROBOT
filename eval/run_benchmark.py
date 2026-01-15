@@ -48,11 +48,18 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
     """
     harness.start_episode()
     
+    # Task success thresholds
+    GOAL_TOLERANCE = 0.10  # 10cm radius around goal (stricter than demo)
+    MIN_DISPLACEMENT = 0.15  # Minimum 15cm movement (stricter than demo)
+    TABLE_HEIGHT_TOLERANCE = 0.03  # 3cm tolerance for "on table" check
+    MIN_LIFT_HEIGHT = 0.05  # 5cm lift to confirm grasp
+    INITIAL_SETTLING_STEPS = 100  # Allow initial contact settling before collision checks
+    MAX_RECOVER_STEPS = 500  # Max steps in RECOVER before declaring failure
+    MAX_COLLISION_COUNT = 5  # Max collisions allowed for partial success
+    
     # Track initial cube position from actual simulation state
     initial_cube_pos = None
     goal_region_center = np.array([-0.2, 0.3, 0.45])  # Target place location
-    goal_tolerance = 0.10  # 10cm radius around goal (stricter)
-    min_displacement = 0.15  # Minimum 15cm movement (stricter)
     
     # Track safety violations for penalties
     collision_count = 0
@@ -79,17 +86,17 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
             # Track RECOVER loops (penalty for repeated failures)
             if current_state == "RECOVER":
                 recover_state_count += 1
-                if recover_state_count > 500:  # Stuck in RECOVER
+                if recover_state_count > MAX_RECOVER_STEPS:  # Stuck in RECOVER
                     return False, "repeated_recover"
             
             # Success: completed task and cube properly placed/displaced
-            if current_state == "IDLE" and step > 100:
+            if current_state == "IDLE" and step > INITIAL_SETTLING_STEPS:
                 if obs.x_obj_pos is not None and initial_cube_pos is not None:
                     # Primary success: cube in goal region with appropriate height
                     distance_to_goal = np.linalg.norm(obs.x_obj_pos[:2] - goal_region_center[:2])
-                    cube_on_table = abs(obs.x_obj_pos[2] - initial_cube_pos[2]) < 0.03  # Within 3cm of table
+                    cube_on_table = abs(obs.x_obj_pos[2] - initial_cube_pos[2]) < TABLE_HEIGHT_TOLERANCE
                     
-                    if distance_to_goal < goal_tolerance and cube_on_table:
+                    if distance_to_goal < GOAL_TOLERANCE and cube_on_table:
                         # Check for safety violations during task
                         if collision_count > 0:
                             return False, "collision_during_task"
@@ -99,11 +106,11 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
                     
                     # Alternative success: cube was displaced and lifted (partial credit)
                     displacement = np.linalg.norm(obs.x_obj_pos[:2] - initial_cube_pos[:2])
-                    if displacement > min_displacement:
+                    if displacement > MIN_DISPLACEMENT:
                         # Check if cube was actually lifted (not just pushed)
-                        if obs.x_obj_pos[2] > initial_cube_pos[2] + 0.05:  # Lifted 5cm
+                        if obs.x_obj_pos[2] > initial_cube_pos[2] + MIN_LIFT_HEIGHT:
                             # Allow partial success even with minor violations
-                            if collision_count > 5:  # Too many collisions
+                            if collision_count > MAX_COLLISION_COUNT:
                                 return False, "excessive_collisions"
                             return True, None
             
@@ -125,16 +132,16 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
                 # Check every 100 steps if stable displacement achieved
                 if step % 100 == 0:
                     # Success: cube displaced and system relatively stable
-                    if displacement > min_displacement and ee_vel < 0.05:
+                    if displacement > MIN_DISPLACEMENT and ee_vel < 0.05:
                         # Check for safety violations
-                        if collision_count > 5:
+                        if collision_count > MAX_COLLISION_COUNT:
                             return False, "excessive_collisions"
                         return True, None
         
         # Safety violations trigger immediate failure (severity matters)
         if obs.self_collision:
             return False, "self_collision"
-        if obs.table_collision and step > 100:  # Allow initial settling
+        if obs.table_collision and step > INITIAL_SETTLING_STEPS:  # Allow initial settling
             return False, "table_collision"
         if obs.penetration > 0.08:  # Very severe penetration
             return False, "severe_penetration"
@@ -144,7 +151,7 @@ def run_episode(harness: RFSNHarness, max_steps: int = 5000, render: bool = Fals
             # For MPC-only, check final state
             if not harness.rfsn_enabled and obs.x_obj_pos is not None and initial_cube_pos is not None:
                 displacement = np.linalg.norm(obs.x_obj_pos[:2] - initial_cube_pos[:2])
-                if displacement > min_displacement and collision_count <= 5:
+                if displacement > MIN_DISPLACEMENT and collision_count <= MAX_COLLISION_COUNT:
                     return True, None  # Partial success for MPC baseline
             return False, "max_steps"
     
