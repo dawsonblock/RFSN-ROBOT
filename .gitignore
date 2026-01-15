@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# MuJoCo
+MUJOCO_LOG.TXT
+
+# RFSN run artifacts
+runs/
+*.csv
+*.jsonl
+
+# Plots and images (keep sample images)
+!stage1_sanity_check.png
+!stage2_mpc_baseline.png
+
+# Temporary files
+tmp/
+*.tmp
+*.log
