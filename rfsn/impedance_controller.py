@@ -187,7 +187,10 @@ class ImpedanceController:
             # where J^# is the pseudo-inverse (or damped least-squares inverse)
             damping = 0.01
             JJT = J @ J.T
-            J_pinv = J.T @ np.linalg.inv(JJT + damping**2 * np.eye(6))
+            A = JJT + damping**2 * np.eye(6)
+            # Solve A X = J instead of explicitly computing A^{-1}
+            X = np.linalg.solve(A, J)
+            J_pinv = X.T
             N = np.eye(7) - J_pinv @ J
             
             # Null-space torque for posture control
