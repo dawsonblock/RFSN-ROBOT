@@ -9,6 +9,131 @@ import numpy as np
 from rfsn.obs_packet import ObsPacket
 
 
+# Global cache for resolved IDs (initialized once per model)
+_ID_CACHE = None
+
+
+class GeomBodyIDs:
+    """
+    Cache of resolved geom/body IDs for fail-loud safety.
+    
+    Ensures contact checking doesn't degrade silently when XML changes.
+    """
+    
+    def __init__(self, model: mj.MjModel):
+        """
+        Resolve and validate all required geom/body IDs.
+        
+        Raises:
+            RuntimeError: If any required geom/body is missing
+        """
+        self.model = model
+        
+        # Required body IDs
+        self.ee_body_id = self._resolve_body("panda_hand", "end-effector")
+        self.cube_body_id = self._resolve_body("cube", "cube object")
+        
+        # Required geom IDs
+        self.cube_geom_id = self._resolve_geom("cube_geom", "cube geometry")
+        self.left_finger_id = self._resolve_geom("panda_finger_left_geom", "left finger")
+        self.right_finger_id = self._resolve_geom("panda_finger_right_geom", "right finger")
+        self.hand_geom_id = self._resolve_geom("panda_hand_geom", "hand palm")
+        self.table_geom_id = self._resolve_geom("table_top", "table surface")
+        
+        # Build set of all panda link geoms (for self-collision detection)
+        self.panda_link_geoms = self._collect_panda_geoms()
+        
+        # Validate we have all required IDs
+        if not self.panda_link_geoms:
+            raise RuntimeError(
+                "FATAL: No panda link geoms found. "
+                "Expected geoms with 'panda' in their names. "
+                "Check XML model structure."
+            )
+        
+        # Log resolved IDs once
+        print("[MUJOCO_UTILS] Resolved geom/body IDs (fail-loud initialization):")
+        print(f"  EE body:         {self.ee_body_id} (panda_hand)")
+        print(f"  Cube body:       {self.cube_body_id} (cube)")
+        print(f"  Cube geom:       {self.cube_geom_id} (cube_geom)")
+        print(f"  Left finger:     {self.left_finger_id} (panda_finger_left_geom)")
+        print(f"  Right finger:    {self.right_finger_id} (panda_finger_right_geom)")
+        print(f"  Hand geom:       {self.hand_geom_id} (panda_hand_geom)")
+        print(f"  Table geom:      {self.table_geom_id} (table_top)")
+        print(f"  Panda link geoms: {len(self.panda_link_geoms)} geoms")
+        
+    def _resolve_body(self, name: str, description: str) -> int:
+        """Resolve body ID with clear error message."""
+        try:
+            body_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, name)
+            if body_id < 0:
+                raise ValueError(f"Invalid body ID: {body_id}")
+            return body_id
+        except Exception as e:
+            raise RuntimeError(
+                f"FATAL: Required body '{name}' ({description}) not found in model. "
+                f"Error: {e}. Check XML model structure."
+            )
+    
+    def _resolve_geom(self, name: str, description: str) -> int:
+        """Resolve geom ID with clear error message."""
+        try:
+            geom_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_GEOM, name)
+            if geom_id < 0:
+                raise ValueError(f"Invalid geom ID: {geom_id}")
+            return geom_id
+        except Exception as e:
+            raise RuntimeError(
+                f"FATAL: Required geom '{name}' ({description}) not found in model. "
+                f"Error: {e}. Check XML model structure."
+            )
+    
+    def _collect_panda_geoms(self) -> set:
+        """Collect all panda link geom IDs."""
+        panda_geoms = set()
+        for i in range(self.model.ngeom):
+            try:
+                name = mj.mj_id2name(self.model, mj.mjtObj.mjOBJ_GEOM, i)
+                if name and 'panda' in name.lower():
+                    panda_geoms.add(i)
+            except:
+                pass  # Skip invalid geoms
+        return panda_geoms
+
+
+def init_id_cache(model: mj.MjModel):
+    """
+    Initialize the global ID cache with resolved geom/body IDs.
+    
+    Must be called once before using other functions.
+    Raises RuntimeError if any required geom/body is missing.
+    
+    Args:
+        model: MuJoCo model
+    """
+    global _ID_CACHE
+    _ID_CACHE = GeomBodyIDs(model)
+
+
+def get_id_cache() -> GeomBodyIDs:
+    """
+    Get the initialized ID cache.
+    
+    Returns:
+        GeomBodyIDs instance
+        
+    Raises:
+        RuntimeError: If cache not initialized
+    """
+    global _ID_CACHE
+    if _ID_CACHE is None:
+        raise RuntimeError(
+            "FATAL: ID cache not initialized. "
+            "Call init_id_cache(model) before using mujoco_utils functions."
+        )
+    return _ID_CACHE
+
+
 def get_ee_pose_and_velocity(model: mj.MjModel, data: mj.MjData) -> tuple:
     """
     Get end-effector pose and velocity.
@@ -16,8 +141,9 @@ def get_ee_pose_and_velocity(model: mj.MjModel, data: mj.MjData) -> tuple:
     Returns:
         (pos, quat, lin_vel, ang_vel)
     """
-    # Get end-effector body
-    ee_body_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_BODY, "panda_hand")
+    # Get end-effector body (use cached ID)
+    ids = get_id_cache()
+    ee_body_id = ids.ee_body_id
     
     # Position
     pos = data.xpos[ee_body_id].copy()
@@ -57,7 +183,9 @@ def get_object_pose(model: mj.MjModel, data: mj.MjData, obj_name: str = "cube") 
 
 def check_contacts(model: mj.MjModel, data: mj.MjData) -> dict:
     """
-    Check for contacts and collisions.
+    Check for contacts and collisions using cached geom IDs.
+    
+    Uses pre-resolved IDs for fail-loud correctness.
     
     Returns:
         {
@@ -76,36 +204,11 @@ def check_contacts(model: mj.MjModel, data: mj.MjData) -> dict:
         'penetration': 0.0
     }
     
-    # Get geom IDs for checking
-    try:
-        cube_geom_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "cube_geom")
-    except:
-        cube_geom_id = -1
-    
-    try:
-        left_finger_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "panda_finger_left_geom")
-        right_finger_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "panda_finger_right_geom")
-        hand_geom_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "panda_hand_geom")
-    except:
-        left_finger_id = right_finger_id = hand_geom_id = -1
-    
-    try:
-        table_geom_id = mj.mj_name2id(model, mj.mjtObj.mjOBJ_GEOM, "table_top")
-    except:
-        table_geom_id = -1
+    # Use cached IDs (fail-loud if not initialized)
+    ids = get_id_cache()
     
     # Check all contacts
     max_penetration = 0.0
-    panda_link_geoms = set()
-    
-    # Collect all panda link geom IDs
-    for i in range(model.ngeom):
-        try:
-            name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, i)
-            if name and 'panda' in name.lower():
-                panda_link_geoms.add(i)
-        except:
-            pass
     
     for i in range(data.ncon):
         contact = data.contact[i]
@@ -113,7 +216,7 @@ def check_contacts(model: mj.MjModel, data: mj.MjData) -> dict:
         dist = contact.dist  # Negative means penetration
         
         # Check if this is self-collision (panda link to panda link)
-        if g1 in panda_link_geoms and g2 in panda_link_geoms:
+        if g1 in ids.panda_link_geoms and g2 in ids.panda_link_geoms:
             # This is internal robot contact
             # Only count as self-collision if significant penetration
             if dist < -0.001:
@@ -121,41 +224,83 @@ def check_contacts(model: mj.MjModel, data: mj.MjData) -> dict:
             continue  # Don't count toward general penetration
         
         # Skip cube-table contact (this is normal and expected)
-        if cube_geom_id >= 0 and table_geom_id >= 0:
-            if (g1 == cube_geom_id and g2 == table_geom_id) or \
-               (g2 == cube_geom_id and g1 == table_geom_id):
-                continue  # Skip this contact, it's expected
+        if (g1 == ids.cube_geom_id and g2 == ids.table_geom_id) or \
+           (g2 == ids.cube_geom_id and g1 == ids.table_geom_id):
+            continue  # Skip this contact, it's expected
         
         # Only count significant penetration (ignore small numerical errors)
         if dist < -0.001:  # 1mm threshold
             max_penetration = max(max_penetration, abs(dist))
         
         # EE-object contact
-        if cube_geom_id >= 0:
-            if (g1 == cube_geom_id and g2 in [left_finger_id, right_finger_id, hand_geom_id]) or \
-               (g2 == cube_geom_id and g1 in [left_finger_id, right_finger_id, hand_geom_id]):
-                result['ee_contact'] = True
-                result['obj_contact'] = True
+        finger_geoms = {ids.left_finger_id, ids.right_finger_id, ids.hand_geom_id}
+        if (g1 == ids.cube_geom_id and g2 in finger_geoms) or \
+           (g2 == ids.cube_geom_id and g1 in finger_geoms):
+            result['ee_contact'] = True
+            result['obj_contact'] = True
         
         # Table collision (with arm, not expected)
-        # Exclude cube-table contact (this is normal and expected)
-        if table_geom_id >= 0 and cube_geom_id >= 0:
-            # Check if arm links collide with table (not cube or gripper)
-            if (g1 == table_geom_id or g2 == table_geom_id):
-                # This is a table contact
-                other_geom = g2 if g1 == table_geom_id else g1
-                
-                # Exclude expected contacts
-                if other_geom != cube_geom_id:  # Not cube-table (expected)
-                    if other_geom not in [left_finger_id, right_finger_id, hand_geom_id]:  # Not gripper-table during grasp
-                        result['table_collision'] = True
+        if g1 == ids.table_geom_id or g2 == ids.table_geom_id:
+            # This is a table contact
+            other_geom = g2 if g1 == ids.table_geom_id else g1
+            
+            # Exclude expected contacts
+            if other_geom != ids.cube_geom_id:  # Not cube-table (expected)
+                if other_geom not in finger_geoms:  # Not gripper-table during grasp
+                    result['table_collision'] = True
     
     result['penetration'] = max_penetration
     
-    # Self-collision detection is already handled above (lines 116-120)
-    # DO NOT override it here - safety layer depends on truthful collision signals
-    
     return result
+
+
+def self_test_contact_parsing(model: mj.MjModel, data: mj.MjData):
+    """
+    Self-test to validate contact parsing works correctly.
+    
+    Runs one forward step and checks that contacts dict has all expected keys.
+    
+    Raises:
+        RuntimeError: If contact parsing fails
+    """
+    try:
+        # Run one forward step
+        mj.mj_forward(model, data)
+        
+        # Check contact parsing
+        contacts = check_contacts(model, data)
+        
+        # Validate all keys present
+        required_keys = ['ee_contact', 'obj_contact', 'table_collision', 
+                        'self_collision', 'penetration']
+        for key in required_keys:
+            if key not in contacts:
+                raise RuntimeError(
+                    f"FATAL: Contact parsing missing key '{key}'. "
+                    "Contact dict is incomplete."
+                )
+        
+        # Validate types
+        for key in ['ee_contact', 'obj_contact', 'table_collision', 'self_collision']:
+            if not isinstance(contacts[key], bool):
+                raise RuntimeError(
+                    f"FATAL: Contact key '{key}' has wrong type {type(contacts[key])}, "
+                    "expected bool."
+                )
+        
+        if not isinstance(contacts['penetration'], (int, float)):
+            raise RuntimeError(
+                f"FATAL: Contact key 'penetration' has wrong type {type(contacts['penetration'])}, "
+                "expected float."
+            )
+        
+        print("[MUJOCO_UTILS] Self-test PASSED: Contact parsing validated")
+        
+    except Exception as e:
+        raise RuntimeError(
+            f"FATAL: Contact parsing self-test failed: {e}. "
+            "Cannot safely proceed with contact-based safety."
+        )
 
 
 def get_gripper_state(model: mj.MjModel, data: mj.MjData) -> dict:
