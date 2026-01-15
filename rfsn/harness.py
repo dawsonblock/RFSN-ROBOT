@@ -176,8 +176,27 @@ class RFSNHarness:
         obs.torque_sat_count = torque_sat_count
         
         # Log
-        if self.logger and decision:
-            self.logger.log_step(obs, decision)
+        if self.logger:
+            if decision:
+                self.logger.log_step(obs, decision)
+            elif self.episode_active:
+                # In MPC-only mode, create a dummy decision for logging
+                dummy_decision = RFSNDecision(
+                    task_mode="IDLE",  # Use IDLE for baseline
+                    x_target_pos=obs.x_ee_pos.copy(),
+                    x_target_quat=obs.x_ee_quat.copy(),
+                    horizon_steps=10,
+                    Q_diag=np.ones(14) * 50.0,
+                    R_diag=0.01 * np.ones(7),
+                    terminal_Q_diag=np.ones(14) * 500.0,
+                    du_penalty=0.01,
+                    max_tau_scale=1.0,
+                    contact_policy="AVOID",
+                    confidence=1.0,
+                    reason="baseline_mpc",
+                    rollback_token="mpc_baseline"
+                )
+                self.logger.log_step(obs, dummy_decision)
         
         if self.episode_active:
             self.obs_history.append(obs)

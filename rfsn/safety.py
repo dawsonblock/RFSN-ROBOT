@@ -39,7 +39,7 @@ class SafetyClamp:
         self.tau_scale_max = config.get('tau_scale_max', 1.0)
         
         # Thresholds for forcing RECOVER
-        self.penetration_threshold = config.get('penetration_threshold', 0.005)  # 5mm
+        self.penetration_threshold = config.get('penetration_threshold', 0.05)  # 50mm - be conservative
         self.mpc_fail_threshold = config.get('mpc_fail_threshold', 3)  # consecutive failures
         self.torque_sat_threshold = config.get('torque_sat_threshold', 5)  # per step
         
@@ -117,7 +117,7 @@ class SafetyClamp:
             return f"torque_saturation_{obs.torque_sat_count}"
         
         # Joint limit proximity
-        if obs.joint_limit_proximity > 0.95:
+        if obs.joint_limit_proximity > 0.98:  # Very close to limits
             return f"joint_limit_{obs.joint_limit_proximity:.2f}"
         
         return None

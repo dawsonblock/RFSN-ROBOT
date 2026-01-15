@@ -96,13 +96,38 @@ def check_contacts(model: mj.MjModel, data: mj.MjData) -> dict:
     
     # Check all contacts
     max_penetration = 0.0
+    panda_link_geoms = set()
+    
+    # Collect all panda link geom IDs
+    for i in range(model.ngeom):
+        try:
+            name = mj.mj_id2name(model, mj.mjtObj.mjOBJ_GEOM, i)
+            if name and 'panda' in name.lower():
+                panda_link_geoms.add(i)
+        except:
+            pass
     
     for i in range(data.ncon):
         contact = data.contact[i]
         g1, g2 = contact.geom1, contact.geom2
         dist = contact.dist  # Negative means penetration
         
-        if dist < 0:
+        # Check if this is self-collision (panda link to panda link)
+        if g1 in panda_link_geoms and g2 in panda_link_geoms:
+            # This is internal robot contact
+            # Only count as self-collision if significant penetration
+            if dist < -0.001:
+                result['self_collision'] = True
+            continue  # Don't count toward general penetration
+        
+        # Skip cube-table contact (this is normal and expected)
+        if cube_geom_id >= 0 and table_geom_id >= 0:
+            if (g1 == cube_geom_id and g2 == table_geom_id) or \
+               (g2 == cube_geom_id and g1 == table_geom_id):
+                continue  # Skip this contact, it's expected
+        
+        # Only count significant penetration (ignore small numerical errors)
+        if dist < -0.001:  # 1mm threshold
             max_penetration = max(max_penetration, abs(dist))
         
         # EE-object contact
@@ -113,13 +138,16 @@ def check_contacts(model: mj.MjModel, data: mj.MjData) -> dict:
                 result['obj_contact'] = True
         
         # Table collision (with arm, not expected)
-        if table_geom_id >= 0:
-            # Check if arm links collide with table
+        # Exclude cube-table contact (this is normal and expected)
+        if table_geom_id >= 0 and cube_geom_id >= 0:
+            # Check if arm links collide with table (not cube or gripper)
             if (g1 == table_geom_id or g2 == table_geom_id):
-                # Exclude expected contacts (cube on table, gripper near table during grasp)
-                if g1 != cube_geom_id and g2 != cube_geom_id:
-                    if g1 not in [left_finger_id, right_finger_id, hand_geom_id] and \
-                       g2 not in [left_finger_id, right_finger_id, hand_geom_id]:
+                # This is a table contact
+                other_geom = g2 if g1 == table_geom_id else g1
+                
+                # Exclude expected contacts
+                if other_geom != cube_geom_id:  # Not cube-table (expected)
+                    if other_geom not in [left_finger_id, right_finger_id, hand_geom_id]:  # Not gripper-table during grasp
                         result['table_collision'] = True
     
     result['penetration'] = max_penetration

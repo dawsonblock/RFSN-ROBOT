@@ -46,6 +46,7 @@ def compute_metrics(episodes_df: pd.DataFrame, events: List[dict]) -> Dict:
             'max_mpc_solve_time_ms': 0.0,
             'mean_penetration': 0.0,
             'mean_episode_duration': 0.0,
+            'mean_steps_per_episode': 0.0,
         }
     
     total = len(episodes_df)

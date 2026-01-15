@@ -102,11 +102,23 @@ class RFSNLogger:
     
     def _log_event(self, event_type: str, time: float, data: dict):
         """Log an event to JSONL."""
+        # Convert numpy types to native Python types
+        converted_data = {}
+        for key, value in data.items():
+            if isinstance(value, np.integer):
+                converted_data[key] = int(value)
+            elif isinstance(value, np.floating):
+                converted_data[key] = float(value)
+            elif isinstance(value, np.ndarray):
+                converted_data[key] = value.tolist()
+            else:
+                converted_data[key] = value
+        
         event = {
             'episode_id': self.current_episode['episode_id'],
             'event_type': event_type,
-            'time': time,
-            'data': data,
+            'time': float(time),
+            'data': converted_data,
         }
         
         with open(self.events_jsonl_path, 'a') as f:
