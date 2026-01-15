@@ -480,18 +480,27 @@ class TaskSpaceRecedingHorizonMPC:
         # Quaternion multiplication
         w1, x1, y1, z1 = q2
         w2, x2, y2, z2 = q1_conj
-        # Convert to axis-angle using the quaternion logarithm map
         q_error = np.array([
             w1*w2 - x1*x2 - y1*y2 - z1*z2,
             w1*x2 + x1*w2 + y1*z2 - z1*y2,
             w1*y2 - x1*z2 + y1*w2 + z1*x2,
             w1*z2 + x1*y2 - y1*x2 + z1*w2
         ])
-        
-        # Convert to axis-angle (small angle approximation)
-        axis_angle = 2.0 * q_error[1:4]
-        
-        return axis_angle
+
+        # Shortest-arc: q and -q represent same rotation
+        if q_error[0] < 0.0:
+            q_error = -q_error
+
+        qw = np.clip(q_error[0], -1.0, 1.0)
+        qv = q_error[1:4]
+        v_norm = np.linalg.norm(qv)
+
+        angle = 2.0 * np.arctan2(v_norm, qw)
+        if v_norm < 1e-8:
+            return 2.0 * qv
+
+        axis = qv / v_norm
+        return axis * angle
     
     def _compute_gradient(
         self,
