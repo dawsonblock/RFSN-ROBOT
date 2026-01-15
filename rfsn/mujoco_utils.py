@@ -100,7 +100,7 @@ class GeomBodyIDs:
                     lower_name = name.lower()
                     if lower_name.startswith(panda_geom_prefixes):
                         panda_geoms.add(i)
-            except:
+            except Exception:
                 pass  # Skip invalid geoms
         return panda_geoms
 
