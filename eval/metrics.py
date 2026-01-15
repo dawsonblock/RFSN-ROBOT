@@ -95,6 +95,26 @@ def compute_metrics(episodes_df: pd.DataFrame, events: List[dict]) -> Dict:
         metrics['failure_reasons'].get('excessive_collisions', 0)
     )
     
+    # V6: Grasp validation metrics
+    if 'grasp_attempts' in episodes_df.columns:
+        metrics['total_grasp_attempts'] = episodes_df['grasp_attempts'].sum()
+        metrics['total_grasp_confirmed'] = episodes_df['grasp_confirmed'].sum()
+        metrics['total_false_lifts'] = episodes_df['false_lift_count'].sum()
+        metrics['mean_grasp_confirmation_time_s'] = episodes_df[episodes_df['grasp_confirmation_time_s'] > 0]['grasp_confirmation_time_s'].mean() if (episodes_df['grasp_confirmation_time_s'] > 0).any() else 0.0
+        metrics['total_slip_events'] = episodes_df['slip_events'].sum()
+        
+        # Calculate grasp success rate (confirmed / attempts)
+        if metrics['total_grasp_attempts'] > 0:
+            metrics['grasp_success_rate'] = metrics['total_grasp_confirmed'] / metrics['total_grasp_attempts']
+        else:
+            metrics['grasp_success_rate'] = 0.0
+        
+        # False lift rate (false lifts / confirmed grasps)
+        if metrics['total_grasp_confirmed'] > 0:
+            metrics['false_lift_rate'] = metrics['total_false_lifts'] / metrics['total_grasp_confirmed']
+        else:
+            metrics['false_lift_rate'] = 0.0
+    
     # Event counts
     event_counts = {}
     for event in events:
@@ -138,6 +158,18 @@ def format_metrics(metrics: Dict) -> str:
     lines.append(f"  Mean duration:             {metrics['mean_episode_duration']:.2f} s")
     lines.append(f"  Mean steps/episode:        {metrics['mean_steps_per_episode']:.1f}")
     lines.append("")
+    
+    # V6: Grasp validation metrics
+    if 'total_grasp_attempts' in metrics:
+        lines.append("GRASP VALIDATION METRICS (V6):")
+        lines.append(f"  Total grasp attempts:      {metrics['total_grasp_attempts']}")
+        lines.append(f"  Grasps confirmed:          {metrics['total_grasp_confirmed']}")
+        lines.append(f"  Grasp success rate:        {metrics['grasp_success_rate']:.1%}")
+        lines.append(f"  False lifts:               {metrics['total_false_lifts']}")
+        lines.append(f"  False lift rate:           {metrics['false_lift_rate']:.1%}")
+        lines.append(f"  Mean confirmation time:    {metrics['mean_grasp_confirmation_time_s']:.2f} s")
+        lines.append(f"  Total slip events:         {metrics['total_slip_events']}")
+        lines.append("")
     
     if metrics.get('failure_reasons'):
         lines.append("FAILURE MODES (CATEGORIZED):")

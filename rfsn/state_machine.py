@@ -185,19 +185,31 @@ class RFSNStateMachine:
             # V6: Enhanced quality-based transition with strict requirements
             if grasp_quality is not None:
                 time_ok = time_in_state > self.min_grasp_time
-                
-                # V6: ALL conditions must be met for GRASP → LIFT
                 quality_ok = grasp_quality.get('quality', 0.0) >= self.grasp_quality_threshold
-                has_bilateral_contact = grasp_quality.get('bilateral_contact', False)
-                is_attached = grasp_quality.get('is_attached', False)
-                no_slip = not grasp_quality.get('slip_detected', True)
-                contact_persistent = grasp_quality.get('contact_persistent', False)
                 
-                # All conditions must hold
-                if time_ok and quality_ok and has_bilateral_contact and is_attached and no_slip and contact_persistent:
-                    print(f"[RFSN] GRASP confirmed: quality={grasp_quality.get('quality', 0.0):.2f}, "
-                          f"attached={is_attached}, persistent={contact_persistent}")
-                    return "LIFT"
+                # V6: Check if enhanced validation fields are present
+                has_enhanced_fields = 'bilateral_contact' in grasp_quality
+                
+                if has_enhanced_fields:
+                    # V6: ALL conditions must be met for GRASP → LIFT (enhanced mode)
+                    has_bilateral_contact = grasp_quality.get('bilateral_contact', False)
+                    is_attached = grasp_quality.get('is_attached', False)
+                    no_slip = not grasp_quality.get('slip_detected', True)
+                    contact_persistent = grasp_quality.get('contact_persistent', False)
+                    
+                    # All conditions must hold
+                    if time_ok and quality_ok and has_bilateral_contact and is_attached and no_slip and contact_persistent:
+                        print(f"[RFSN] GRASP confirmed (enhanced): quality={grasp_quality.get('quality', 0.0):.2f}, "
+                              f"attached={is_attached}, persistent={contact_persistent}")
+                        return "LIFT"
+                else:
+                    # Fallback to v5 behavior (old grasp quality check)
+                    has_contact = grasp_quality.get('has_contact', False)
+                    is_attached = grasp_quality.get('is_attached', False)
+                    
+                    if time_ok and quality_ok:
+                        print(f"[RFSN] GRASP confirmed (v5 mode): quality={grasp_quality.get('quality', 0.0):.2f}")
+                        return "LIFT"
                 
                 # Timeout to RECOVER if grasp can't be confirmed
                 MAX_GRASP_TIME = 3.0  # Maximum time to attempt grasp
@@ -215,8 +227,8 @@ class RFSNStateMachine:
                     return "LIFT"
         
         elif self.current_state == "LIFT":
-            # V6: Continuous slip/attachment monitoring during LIFT
-            if grasp_quality is not None:
+            # V6: Continuous slip/attachment monitoring during LIFT (only in enhanced mode)
+            if grasp_quality is not None and 'slip_detected' in grasp_quality:
                 # Check for attachment loss or slip
                 is_attached = grasp_quality.get('is_attached', False)
                 slip_detected = grasp_quality.get('slip_detected', False)
