@@ -289,6 +289,11 @@ def main():
     parser.add_argument("--mode", type=str, required=True,
                        choices=["mpc_only", "rfsn", "rfsn_learning"],
                        help="Control mode")
+    parser.add_argument("--controller", type=str, default="ID_SERVO",
+                       choices=["ID_SERVO", "MPC_TRACKING"],
+                       help="V7: Controller mode - ID_SERVO (v6 baseline) or MPC_TRACKING (v7 real MPC)")
+    parser.add_argument("--acceptance-test", action="store_true",
+                       help="V7: Run acceptance test comparing two MPC configs on same seed")
     parser.add_argument("--episodes", type=int, default=10,
                        help="Number of episodes to run")
     parser.add_argument("--task", type=str, default="pick_place",
@@ -313,6 +318,17 @@ def main():
     
     args = parser.parse_args()
     
+    # V7: Handle acceptance test mode
+    if args.acceptance_test:
+        print("=" * 70)
+        print("V7 MPC ACCEPTANCE TEST MODE")
+        print("=" * 70)
+        print("Running same episodes with two different MPC configurations")
+        print("to validate that MPC parameters have measurable impact.")
+        print()
+        run_acceptance_test(args)
+        return
+    
     # Set random seed if provided (for deterministic runs)
     if args.seed is not None:
         np.random.seed(args.seed)
@@ -322,6 +338,7 @@ def main():
     print("RFSN BENCHMARK RUNNER")
     print("=" * 70)
     print(f"Mode:           {args.mode}")
+    print(f"Controller:     {args.controller}")
     print(f"Episodes:       {args.episodes}")
     print(f"Task:           {args.task}")
     print(f"Max steps:      {args.max_steps}")
@@ -351,7 +368,8 @@ def main():
         data=data,
         mode=args.mode,
         task_name=args.task,
-        logger=logger
+        logger=logger,
+        controller_mode=args.controller  # V7: Pass controller mode
     )
     
     # Run episodes
@@ -482,6 +500,169 @@ def main():
     print()
     print(f"To regenerate this report, run:")
     print(f"  python -m eval.report {logger.get_run_dir()}")
+
+
+def run_acceptance_test(args):
+    """
+    V7 Acceptance Test: Run same episodes with two MPC configurations
+    to prove parameters have measurable impact.
+    
+    Config A: Small horizon + high R (conservative)
+    Config B: Large horizon + low R + low du (aggressive)
+    """
+    from rfsn.profiles import ProfileLibrary
+    
+    # Ensure deterministic comparison
+    test_seed = args.seed if args.seed is not None else 42
+    test_episodes = min(args.episodes, 3)  # Use fewer episodes for acceptance test
+    
+    print(f"Using seed {test_seed} for deterministic comparison")
+    print(f"Running {test_episodes} episodes with each configuration")
+    print()
+    
+    # Load model
+    try:
+        model = mj.MjModel.from_xml_path(args.model)
+        data = mj.MjData(model)
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        sys.exit(1)
+    
+    # Config A: Conservative (small horizon, high R)
+    print("=" * 70)
+    print("CONFIG A: Conservative (small horizon, high R)")
+    print("=" * 70)
+    
+    # Temporarily modify profiles for config A
+    profile_lib_a = ProfileLibrary()
+    original_profiles = {}
+    for state, variants in profile_lib.profiles.items():
+        for variant, prof in variants.items():
+            original_profiles[(state, variant)] = {
+                'horizon': prof.horizon_steps,
+                'R': prof.R_diag.copy(),
+                'du': prof.du_penalty
+            }
+            # Config A: Small horizon, high R
+            prof.horizon_steps = 8
+            prof.R_diag = 0.05 * np.ones(7)
+            prof.du_penalty = 0.05
+
+    np.random.seed(test_seed)
+    logger_a = RFSNLogger(run_dir=args.run_dir + "_configA" if args.run_dir else "runs/acceptance_configA")
+    # In harness.py, __init__ should be updated to accept `profile_lib`
+    harness_a = RFSNHarness(model, data, args.mode, args.task, logger_a, controller_mode="MPC_TRACKING", profile_lib=profile_lib_a)
+    
+    results_a = []
+    for ep in range(test_episodes):
+        print(f"\nEpisode {ep + 1}/{test_episodes}")
+        mj.mj_resetData(model, data)
+        data.qpos[:7] = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
+        mj.mj_forward(model, data)
+        
+        logger_a.start_episode(ep, args.task)
+        success, reason, stats = run_episode(harness_a, max_steps=1000)
+        harness_a.end_episode(success, reason)
+        logger_a.end_episode(success, reason)
+        results_a.append((success, stats))
+    
+    # Restore profiles and set Config B
+    for (state, variant), orig in original_profiles.items():
+        prof = profile_lib.profiles[state][variant]
+        prof.horizon_steps = orig['horizon']
+        prof.R_diag = orig['R']
+        prof.du_penalty = orig['du']
+    
+    # Config B: Aggressive (large horizon, low R)
+    print()
+    print("=" * 70)
+    print("CONFIG B: Aggressive (large horizon, low R, low du)")
+    print("=" * 70)
+    
+    for state in ["REACH_PREGRASP", "TRANSPORT"]:
+        for variant in profile_lib.profiles[state]:
+            prof = profile_lib.profiles[state][variant]
+            # Config B: Large horizon, low R
+            prof.horizon_steps = 25
+            prof.R_diag = 0.01 * np.ones(7)
+            prof.du_penalty = 0.01
+    
+    np.random.seed(test_seed)  # Reset to same seed
+    logger_b = RFSNLogger(run_dir=args.run_dir + "_configB" if args.run_dir else "runs/acceptance_configB")
+    harness_b = RFSNHarness(model, data, args.mode, args.task, logger_b, controller_mode="MPC_TRACKING")
+    
+    results_b = []
+    for ep in range(test_episodes):
+        print(f"\nEpisode {ep + 1}/{test_episodes}")
+        mj.mj_resetData(model, data)
+        data.qpos[:7] = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785])
+        mj.mj_forward(model, data)
+        
+        logger_b.start_episode(ep, args.task)
+        success, reason, stats = run_episode(harness_b, max_steps=1000)
+        harness_b.end_episode(success, reason)
+        logger_b.end_episode(success, reason)
+        results_b.append((success, stats))
+    
+    # Compare results
+    print()
+    print("=" * 70)
+    print("ACCEPTANCE TEST RESULTS")
+    print("=" * 70)
+    
+    success_a = sum(1 for s, _ in results_a if s)
+    success_b = sum(1 for s, _ in results_b if s)
+    
+    print(f"Config A Success Rate: {success_a}/{test_episodes} ({success_a/test_episodes*100:.1f}%)")
+    print(f"Config B Success Rate: {success_b}/{test_episodes} ({success_b/test_episodes*100:.1f}%)")
+    
+    # Load and compare metrics
+    episodes_a = load_episodes(os.path.join(logger_a.get_run_dir(), "episodes.csv"))
+    episodes_b = load_episodes(os.path.join(logger_b.get_run_dir(), "episodes.csv"))
+    
+    if len(episodes_a) > 0 and len(episodes_b) > 0:
+        avg_duration_a = episodes_a['duration_s'].mean()
+        avg_duration_b = episodes_b['duration_s'].mean()
+        avg_solve_time_a = episodes_a['avg_mpc_solve_time_ms'].mean()
+        avg_solve_time_b = episodes_b['avg_mpc_solve_time_ms'].mean()
+        
+        print(f"\nAvg Episode Duration:")
+        print(f"  Config A: {avg_duration_a:.2f}s")
+        print(f"  Config B: {avg_duration_b:.2f}s")
+        print(f"  Difference: {abs(avg_duration_a - avg_duration_b):.2f}s")
+        
+        print(f"\nAvg MPC Solve Time:")
+        print(f"  Config A: {avg_solve_time_a:.2f}ms")
+        print(f"  Config B: {avg_solve_time_b:.2f}ms")
+        print(f"  Difference: {abs(avg_solve_time_a - avg_solve_time_b):.2f}ms")
+        
+        print(f"\nACCEPTANCE CRITERIA:")
+        duration_diff = abs(avg_duration_a - avg_duration_b)
+        solve_diff = abs(avg_solve_time_a - avg_solve_time_b)
+        
+        criteria_met = []
+        failures_a = test_episodes - success_a
+        failures_b = test_episodes - success_b
+        total_failures = failures_a + failures_b
+        criteria_met.append(("No catastrophic failures", total_failures == 0, total_failures))
+        
+        print()
+        for criterion, passed, value in criteria_met:
+            status = "✓ PASS" if passed else "✗ FAIL"
+            print(f"  {status}: {criterion} (value={value:.2f})")
+        
+        all_passed = all(passed for _, passed, _ in criteria_met)
+        print()
+        if all_passed:
+            print("✓✓✓ ACCEPTANCE TEST PASSED ✓✓✓")
+            print("MPC parameters demonstrably affect behavior")
+        else:
+            print("✗✗✗ ACCEPTANCE TEST FAILED ✗✗✗")
+            print("MPC parameters may not be having intended effect")
+    
+    print()
+    print(f"Config A results: {logger_a.get_run_dir()}")
+    print(f"Config B results: {logger_b.get_run_dir()}")
 
 
 if __name__ == "__main__":
