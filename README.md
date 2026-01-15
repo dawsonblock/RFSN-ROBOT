@@ -39,6 +39,7 @@ Traditional Approach:          RFSN Approach:
 
 ## ✨ Features
 
+### Core Capabilities
 - 🎯 **Discrete State Machine** - 11 states for complex manipulation tasks (pick, place, throw)
 - 🛡️ **Safety First** - Automatic recovery from collisions, torque limits, and constraint violations
 - 📚 **Profile Library** - 43 pre-tuned MPC parameter profiles (3-5 variants per state)
@@ -48,7 +49,31 @@ Traditional Approach:          RFSN Approach:
 - 📊 **Rich Logging** - Comprehensive metrics and event tracking (CSV + JSONL)
 - 🔌 **Zero Invasive** - Pure additive integration, baseline behavior preserved when disabled
 
+### v8 NEW: Advanced Control Modes
+- 🎯 **Task-Space MPC** - Direct end-effector trajectory optimization (position + orientation)
+- 🤝 **Impedance Control** - Force-based compliant manipulation for soft grasps and gentle placement
+- 🔄 **Multi-Modal Control** - Switch between joint-space MPC, task-space MPC, impedance, or PD control
+- 📐 **Dexterous Manipulation** - Optimize EE motion directly for better precision and obstacle avoidance
+
 ## 🚀 Quick Start
+
+### Controller Modes (v8)
+
+RFSN-ROBOT supports multiple controller modes for different use cases:
+
+```bash
+# v6: PD control + inverse dynamics (baseline)
+python -m eval.run_benchmark --mode rfsn --controller ID_SERVO --episodes 10
+
+# v7: Joint-space MPC (anticipatory, smooth)
+python -m eval.run_benchmark --mode rfsn --controller MPC_TRACKING --episodes 10
+
+# v8: Task-space MPC (dexterous, direct EE control)
+python -m eval.run_benchmark --mode rfsn --controller TASK_SPACE_MPC --episodes 10
+
+# v8: Impedance control (compliant, force-based)
+python -m eval.run_benchmark --mode rfsn --controller IMPEDANCE --episodes 10
+```
 
 ### Three Operating Modes
 
