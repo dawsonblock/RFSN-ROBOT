@@ -837,8 +837,8 @@ def compute_contact_wrenches(model: mj.MjModel, data: mj.MjData, geom_pairs=None
                     result['cube_table_force_world'] += force
                 
                 # EE-table
-                if (g1 == ids.table_geom_id and g2 in finger_geoms) or \
-                   (g2 == ids.table_geom_id and g1 in finger_geoms):
+                # Allocate array for contact force (6D: force + torque in contact frame)
+                c_array = np.zeros(6, dtype=np.float64)
                     result['ee_table_force_world'] += force
         
         return result
