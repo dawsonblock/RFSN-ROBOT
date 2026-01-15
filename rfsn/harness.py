@@ -430,7 +430,7 @@ class RFSNHarness:
         base_ori_weight = 0.3  # Lower weight than position (soft orientation)
         if obs and (obs.ee_contact or obs.obj_contact):
             # Reduce orientation weight during contact
-            ori_weight = base_ori_weight * 0.3  # 90% reduction
+            ori_weight = base_ori_weight * 0.3  # 70% reduction
         elif decision.task_mode in ["GRASP", "PLACE"]:
             # Allow moderate orientation weight for grasp/place when not in contact
             ori_weight = base_ori_weight
