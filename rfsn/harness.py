@@ -272,7 +272,7 @@ class RFSNHarness:
                 
                 # Check if this profile should be poisoned (2+ severe events in last 5 uses)
                 stats = self.learner.stats[(state, profile)]
-                if stats.N >= 5:
+                if stats.N >= 5 and hasattr(stats, 'recent_scores'):
                     recent_severe_count = sum(1 for s in stats.recent_scores[-5:] if s < -5.0)
                     if recent_severe_count >= 2:
                         # Poison this profile to prevent future selection
@@ -443,18 +443,6 @@ class RFSNHarness:
         result['quality'] = quality
         
         return result
-    
-    def get_stats(self) -> dict:
-        tau = data_temp.qfrc_inverse[:7].copy()
-        
-        # Apply torque scale if decision provided
-        if decision:
-            tau *= decision.max_tau_scale
-        
-        # Saturate
-        tau = np.clip(tau, -87.0, 87.0)
-        
-        return tau
     
     def get_stats(self) -> dict:
         """Get harness statistics."""
