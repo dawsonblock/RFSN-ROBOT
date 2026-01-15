@@ -331,9 +331,11 @@ class RecedingHorizonMPC:
         qd_traj[0, :] = qd0
         
         for t in range(H):
-            # Simple Euler integration
-            q_traj[t + 1, :] = q_traj[t, :] + dt * qd_traj[t, :]
+            # Semi-implicit (symplectic) Euler integration:
+            # 1) update velocity from acceleration
             qd_traj[t + 1, :] = qd_traj[t, :] + dt * qdd_trajectory[t, :]
+            # 2) update position using the new velocity
+            q_traj[t + 1, :] = q_traj[t, :] + dt * qd_traj[t + 1, :]
         
         return q_traj, qd_traj
     
