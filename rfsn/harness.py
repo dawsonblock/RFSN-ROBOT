@@ -296,23 +296,38 @@ class RFSNHarness:
             self.logger.end_episode(success, failure_reason)
 
     
-    def _ee_target_to_joint_target(self, decision: RFSNDecision) -> np.ndarray:
+    def _ee_target_to_joint_target(self, decision: RFSNDecision, use_orientation: bool = None) -> np.ndarray:
         """
         Convert end-effector target to joint target using damped least squares IK.
         
-        Uses MuJoCo Jacobian and iterative position-based IK with damping.
+        Args:
+            decision: Decision containing target pose
+            use_orientation: If True, include orientation in IK. If None, auto-decide based on state.
+        
+        Uses MuJoCo Jacobian and iterative pose-based (position + orientation) IK with damping.
+        Orientation is soft-weighted and optional per state for stability.
         """
         q_current = self.data.qpos[:7].copy()
         
         # Get end-effector body ID
         ee_body_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_BODY, "panda_hand")
         
+        # Decide whether to use orientation based on state (if not explicitly specified)
+        if use_orientation is None:
+            # Enable orientation for states where precise pose matters
+            use_orientation = decision.task_mode in ["GRASP", "PLACE", "REACH_GRASP"]
+        
         # Iterative IK with damped least squares
         q_ik = q_current.copy()
         alpha = 0.5  # Step size
-        damping = 0.01  # Damping factor for numerical stability
+        damping_pos = 0.01  # Position damping for stability
+        damping_rot = 0.05  # Higher rotation damping (orientation is soft)
         max_iterations = 10
         pos_tolerance = 0.01  # 1cm
+        ori_tolerance = 0.1   # Quaternion distance tolerance
+        
+        # Orientation weight (soft constraint)
+        ori_weight = 0.3  # Lower weight than position (soft orientation)
         
         for iteration in range(max_iterations):
             # Update MuJoCo data with current joint positions
@@ -321,29 +336,48 @@ class RFSNHarness:
             data_temp.qpos[:7] = q_ik
             mj.mj_forward(self.model, data_temp)
             
-            # Get current EE position
+            # Get current EE pose
             ee_pos_current = data_temp.xpos[ee_body_id].copy()
+            ee_quat_current = data_temp.xquat[ee_body_id].copy()  # [w, x, y, z]
             
             # Compute position error
             pos_error = decision.x_target_pos - ee_pos_current
             
+            # Compute orientation error (axis-angle from quaternion difference)
+            ori_error = np.zeros(3)
+            if use_orientation:
+                ori_error = self._quaternion_error(ee_quat_current, decision.x_target_quat)
+            
             # Check convergence
-            if np.linalg.norm(pos_error) < pos_tolerance:
+            pos_converged = np.linalg.norm(pos_error) < pos_tolerance
+            ori_converged = np.linalg.norm(ori_error) < ori_tolerance if use_orientation else True
+            if pos_converged and ori_converged:
                 break
             
-            # Compute Jacobian for end-effector position
+            # Compute Jacobians
             jacp = np.zeros((3, self.model.nv))  # Position Jacobian
             jacr = np.zeros((3, self.model.nv))  # Rotation Jacobian
             mj.mj_jacBodyCom(self.model, data_temp, jacp, jacr, ee_body_id)
             
             # Extract arm joints only (first 7 DOF)
-            J = jacp[:, :7]
+            J_pos = jacp[:, :7]
+            J_rot = jacr[:, :7]
             
-            # Damped least squares: dq = J^T (J J^T + λ²I)^{-1} * dx
-            # This is more stable than pseudo-inverse for redundant manipulators
-            JJT = J @ J.T
-            damping_matrix = damping**2 * np.eye(3)
-            dq = J.T @ np.linalg.solve(JJT + damping_matrix, pos_error)
+            if use_orientation:
+                # Combine position and orientation Jacobians
+                # Stack: [position (3), orientation (3)]
+                J = np.vstack([J_pos, ori_weight * J_rot])
+                error = np.concatenate([pos_error, ori_weight * ori_error])
+                
+                # Damped least squares with combined Jacobian
+                JJT = J @ J.T
+                damping_matrix = np.diag([damping_pos**2] * 3 + [damping_rot**2] * 3)
+                dq = J.T @ np.linalg.solve(JJT + damping_matrix, error)
+            else:
+                # Position-only IK (original behavior)
+                JJT = J_pos @ J_pos.T
+                damping_matrix = damping_pos**2 * np.eye(3)
+                dq = J_pos.T @ np.linalg.solve(JJT + damping_matrix, pos_error)
             
             # Update joint angles with step size
             q_ik += alpha * dq
@@ -355,6 +389,49 @@ class RFSNHarness:
                 q_ik[i] = np.clip(q_ik[i], q_min, q_max)
         
         return q_ik
+    
+    def _quaternion_error(self, q_current: np.ndarray, q_target: np.ndarray) -> np.ndarray:
+        """
+        Compute orientation error as axis-angle from quaternion difference.
+        
+        Args:
+            q_current: Current quaternion [w, x, y, z]
+            q_target: Target quaternion [w, x, y, z]
+        
+        Returns:
+            axis-angle error (3,) for use in Jacobian IK
+        """
+        # Ensure quaternions are normalized
+        q_current = q_current / np.linalg.norm(q_current)
+        q_target = q_target / np.linalg.norm(q_target)
+        
+        # Compute quaternion difference: q_error = q_target * q_current^{-1}
+        # Quaternion conjugate (inverse for unit quaternions)
+        q_current_conj = np.array([q_current[0], -q_current[1], -q_current[2], -q_current[3]])
+        
+        # Quaternion multiplication: q_error = q_target * q_current_conj
+        w1, x1, y1, z1 = q_target
+        w2, x2, y2, z2 = q_current_conj
+        
+        q_error = np.array([
+            w1*w2 - x1*x2 - y1*y2 - z1*z2,  # w
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,  # x
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,  # y
+            w1*z2 + x1*y2 - y1*x2 + z1*w2   # z
+        ])
+        
+        # Convert to axis-angle (small angle approximation for stability)
+        # For small rotations: axis * angle ≈ 2 * [x, y, z] components
+        # This is valid when w ≈ 1 (small rotation)
+        axis_angle = 2.0 * q_error[1:4]
+        
+        # Clamp to prevent large corrections
+        max_angle = 0.5  # ~28 degrees max per iteration
+        angle_norm = np.linalg.norm(axis_angle)
+        if angle_norm > max_angle:
+            axis_angle = axis_angle * (max_angle / angle_norm)
+        
+        return axis_angle
     
     def _inverse_dynamics_control(
         self,
