@@ -536,9 +536,8 @@ def run_acceptance_test(args):
     # Temporarily modify profiles for config A
     profile_lib_a = ProfileLibrary()
     original_profiles = {}
-    for state in ["REACH_PREGRASP", "TRANSPORT"]:
-        for variant in profile_lib_a.profiles[state]:
-            prof = profile_lib_a.profiles[state][variant]
+    for state, variants in profile_lib.profiles.items():
+        for variant, prof in variants.items():
             original_profiles[(state, variant)] = {
                 'horizon': prof.horizon_steps,
                 'R': prof.R_diag.copy(),
