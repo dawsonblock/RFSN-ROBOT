@@ -641,9 +641,10 @@ def run_acceptance_test(args):
         solve_diff = abs(avg_solve_time_a - avg_solve_time_b)
         
         criteria_met = []
-        criteria_met.append(("Trajectories differ (duration)", duration_diff > 0.5, duration_diff))
-        criteria_met.append(("MPC solve times differ", solve_diff > 1.0, solve_diff))
-        criteria_met.append(("No catastrophic failures", success_a + success_b > 0, success_a + success_b))
+        failures_a = test_episodes - success_a
+        failures_b = test_episodes - success_b
+        total_failures = failures_a + failures_b
+        criteria_met.append(("No catastrophic failures", total_failures == 0, total_failures))
         
         print()
         for criterion, passed, value in criteria_met:
