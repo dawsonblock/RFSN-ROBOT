@@ -721,12 +721,12 @@ class RecedingHorizonMPCQP:
                 eps_abs=1e-4,
                 eps_rel=1e-4,
                 max_iter=self.config.max_iterations,
-                time_limit=self.config.time_budget_ms / 1000.0  # Convert to seconds
+                time_limit=self.config.time_budget_ms / 1000.0
             )
             self.prev_horizon = H
         else:
-            # Update problem matrices
-            self.solver.update(q=q_vec, l=l_full, u=u_full)
+            # Update cost and constraint matrices when parameters change
+            self.solver.update(Px=P.data, q=q_vec, l=l_full, u=u_full)
         
         # Warm start if available
         if self.prev_solution is not None and len(self.prev_solution) == n_z:
