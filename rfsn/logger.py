@@ -285,7 +285,7 @@ class RFSNLogger:
         # Note: Include zero times (very fast solves) but exclude uninitialized (-1 or None)
         mpc_solve_times = [o.mpc_solve_time_ms for o in obs_history 
                           if o.controller_mode == "MPC_TRACKING" and o.mpc_solve_time_ms >= 0]
-        avg_mpc_solve_time = sum(mpc_solve_times) / len(mpc_solve_times) if mpc_solve_times else 0.0
+        avg_mpc_solve_time = (sum(mpc_solve_times) / len(mpc_solve_times)) if mpc_solve_times else np.nan
         
         # Write to CSV
         with open(self.episodes_csv_path, 'a', newline='') as f:
