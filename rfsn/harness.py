@@ -109,6 +109,7 @@ class RFSNHarness:
         self.episode_active = False
         self.obs_history = []
         self.decision_history = []
+        self.initial_cube_z = None  # Track initial cube height for grasp quality
         
     def start_episode(self):
         """Start a new episode."""
@@ -117,6 +118,7 @@ class RFSNHarness:
         self.episode_active = True
         self.obs_history = []
         self.decision_history = []
+        self.initial_cube_z = None
         
         if self.rfsn_enabled:
             self.state_machine.reset()
@@ -139,6 +141,10 @@ class RFSNHarness:
             task_name=self.task_name
         )
         
+        # Track initial cube height on first step
+        if self.initial_cube_z is None and obs.x_obj_pos is not None:
+            self.initial_cube_z = obs.x_obj_pos[2]
+        
         # Generate decision
         if self.rfsn_enabled:
             # RFSN mode: state machine generates decision
@@ -150,7 +156,13 @@ class RFSNHarness:
                     safety_poison_check=self.safety_clamp.is_poisoned
                 )
             
-            decision = self.state_machine.step(obs, profile_override=profile_variant)
+            # Compute grasp quality for GRASP state
+            grasp_quality = None
+            if self.state_machine.current_state == "GRASP":
+                grasp_quality = self._check_grasp_quality(obs, self.initial_cube_z)
+            
+            decision = self.state_machine.step(obs, profile_override=profile_variant,
+                                              grasp_quality=grasp_quality)
             
             # Apply safety clamps
             decision = self.safety_clamp.apply(decision, obs)
@@ -396,20 +408,26 @@ class RFSNHarness:
         
         return tau
     
-    def _check_grasp_quality(self, obs: ObsPacket) -> dict:
+    def _check_grasp_quality(self, obs: ObsPacket, initial_cube_z: float = None) -> dict:
         """
-        Check grasp quality based on contacts and gripper state.
+        Check grasp quality based on contacts, gripper state, and cube attachment.
+        
+        Args:
+            obs: Current observation
+            initial_cube_z: Initial cube height (for attachment detection)
         
         Returns:
             {
                 'has_contact': bool - whether fingers are in contact with object
                 'is_stable': bool - whether grasp is stable (both fingers, low motion)
+                'is_attached': bool - whether cube is following EE (attachment proxy)
                 'quality': float - grasp quality score 0-1
             }
         """
         result = {
             'has_contact': obs.obj_contact and obs.ee_contact,
             'is_stable': False,
+            'is_attached': False,
             'quality': 0.0
         }
         
@@ -427,20 +445,27 @@ class RFSNHarness:
         if obs.x_obj_pos is not None:
             ee_vel_norm = np.linalg.norm(obs.xd_ee_lin)
             is_low_motion = ee_vel_norm < 0.1  # Less than 10cm/s
+            
+            # Check cube attachment: cube should have lifted from initial position
+            if initial_cube_z is not None:
+                cube_lifted = obs.x_obj_pos[2] > (initial_cube_z + 0.02)  # Lifted 2cm
+                result['is_attached'] = cube_lifted
         else:
             is_low_motion = True
         
-        # Grasp is stable if closed and low motion
+        # Grasp is stable if closed, low motion, and has contact
         result['is_stable'] = is_closed and is_low_motion and result['has_contact']
         
         # Compute quality score
         quality = 0.0
         if result['has_contact']:
-            quality += 0.4
+            quality += 0.3  # Contact
         if is_closed:
-            quality += 0.3
+            quality += 0.25  # Gripper closed
         if is_low_motion:
-            quality += 0.3
+            quality += 0.2  # Low velocity
+        if result['is_attached']:
+            quality += 0.25  # Cube lifted (strong indicator)
         
         result['quality'] = quality
         

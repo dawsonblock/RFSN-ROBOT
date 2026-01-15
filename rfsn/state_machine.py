@@ -78,13 +78,19 @@ class RFSNStateMachine:
         self.recover_attempts = 0
         self.max_recover_attempts = 3
         
-    def step(self, obs: ObsPacket, profile_override: Optional[str] = None) -> RFSNDecision:
+        # Grasp quality tracking
+        self.grasp_quality_threshold = 0.7  # Require 70% quality to lift
+        self.min_grasp_time = 0.5  # Minimum time in GRASP before checking quality
+        
+    def step(self, obs: ObsPacket, profile_override: Optional[str] = None, 
+             grasp_quality: Optional[dict] = None) -> RFSNDecision:
         """
         Execute one state machine step.
         
         Args:
             obs: Current observation
             profile_override: Optional profile variant to use (for learning)
+            grasp_quality: Optional grasp quality dict from harness
             
         Returns:
             Decision for this control step
@@ -97,8 +103,8 @@ class RFSNStateMachine:
         profile_variant = profile_override or self.selected_profile
         profile = self.profile_library.get_profile(self.current_state, profile_variant)
         
-        # Check transitions
-        next_state = self._check_transitions(obs)
+        # Check transitions (pass grasp quality)
+        next_state = self._check_transitions(obs, grasp_quality)
         
         if next_state != self.current_state:
             print(f"[RFSN] State transition: {self.current_state} → {next_state}")
@@ -132,8 +138,14 @@ class RFSNStateMachine:
         
         return decision
     
-    def _check_transitions(self, obs: ObsPacket) -> str:
-        """Check guard conditions for state transitions."""
+    def _check_transitions(self, obs: ObsPacket, grasp_quality: Optional[dict] = None) -> str:
+        """
+        Check guard conditions for state transitions.
+        
+        Args:
+            obs: Current observation
+            grasp_quality: Optional grasp quality from harness
+        """
         time_in_state = obs.t - self.state_entry_time
         
         # FAIL is terminal
@@ -170,8 +182,23 @@ class RFSNStateMachine:
                 return "GRASP"
         
         elif self.current_state == "GRASP":
-            if time_in_state > 1.5 and obs.obj_contact:
-                return "LIFT"
+            # Quality-based transition: require good grasp before lifting
+            # Fallback to time-based if grasp_quality not provided
+            if grasp_quality is not None:
+                time_ok = time_in_state > self.min_grasp_time
+                quality_ok = grasp_quality.get('quality', 0.0) >= self.grasp_quality_threshold
+                has_contact = grasp_quality.get('has_contact', False)
+                
+                if time_ok and quality_ok:
+                    return "LIFT"
+                elif time_in_state > 2.0 and not has_contact:
+                    # No contact after 2s - go to RECOVER
+                    print(f"[RFSN] GRASP failed: no contact after 2s")
+                    return "RECOVER"
+            else:
+                # Fallback: time + contact only (old behavior)
+                if time_in_state > 1.5 and obs.obj_contact:
+                    return "LIFT"
         
         elif self.current_state == "LIFT":
             if self._at_target(obs.x_ee_pos, self.lift_pos, obs.xd_ee_lin):
