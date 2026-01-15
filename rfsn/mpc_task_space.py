@@ -421,12 +421,14 @@ class TaskSpaceRecedingHorizonMPC:
             cost_orientation += np.sum(Q_ori * ori_error**2)
         
         # Velocity cost (computed from joint velocities via Jacobian approximation)
-        # For simplicity, use joint velocity magnitude as proxy for EE velocity
+        # For simplicity, penalize joint velocity magnitude scaled by velocity weights
         cost_velocity = 0.0
         for t in range(H):
-            # Approximate: EE velocity ≈ J * qd
-            # Here we just penalize joint velocity magnitude (simpler, still effective)
-            cost_velocity += np.sum(Q_vel[:3] * qd_traj[t, :]**2 / 7.0)
+            # Simple approach: average the velocity cost across all joints
+            # More accurate would be J * qd to get EE velocity, but this is sufficient
+            avg_lin_vel_weight = np.mean(Q_vel[:3])
+            avg_ang_vel_weight = np.mean(Q_vel[3:6])
+            cost_velocity += (avg_lin_vel_weight + avg_ang_vel_weight) * np.sum(qd_traj[t, :]**2) / 7.0
         
         # Effort cost
         cost_effort = np.sum(R * qdd_trajectory**2)
