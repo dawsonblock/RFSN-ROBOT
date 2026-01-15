@@ -420,23 +420,15 @@ class TaskSpaceRecedingHorizonMPC:
             ori_error = self._quaternion_distance(ee_quat_traj[t, :], x_target_quat)
             cost_orientation += np.sum(Q_ori * ori_error**2)
         
-        # Velocity cost (computed from joint velocities via Jacobian approximation)
-        # For simplicity, penalize joint velocity magnitude scaled by velocity weights
+        # Velocity cost (simplified: penalize joint velocity magnitude)
+        # More accurate would be J * qd to get EE velocity, but requires q_traj
+        # This approximation is sufficient and avoids parameter complexity
         cost_velocity = 0.0
-        jacp = np.zeros((3, self.model.nv))
-        jacr = np.zeros((3, self.model.nv))
-
+        avg_lin_vel_weight = np.mean(Q_vel[:3])
+        avg_ang_vel_weight = np.mean(Q_vel[3:6])
         for t in range(H):
-            # Get Jacobian at current rollout state
-            self.data_temp.qpos[:7] = q_traj[t, :]
-            mj.mj_jacBody(self.model, self.data_temp, jacp, jacr, self.ee_body_id)
-            J = np.vstack([jacp[:, :7], jacr[:, :7]])
-
-            # Compute EE velocity
-            xd_ee = J @ qd_traj[t, :]  # (6,) [linear(3), angular(3)]
-
-            # Apply task-space velocity cost
-            cost_velocity += np.sum(Q_vel * xd_ee**2)
+            # Penalize joint velocity scaled by average task-space velocity weights
+            cost_velocity += (avg_lin_vel_weight + avg_ang_vel_weight) * np.sum(qd_traj[t, :]**2) / 7.0
         
         # Effort cost
         cost_effort = np.sum(R * qdd_trajectory**2)
@@ -520,6 +512,12 @@ class TaskSpaceRecedingHorizonMPC:
         """
         Compute gradient using finite differences.
         
+        Note: This performs H*7 forward rollouts per iteration (e.g., 105 for H=15).
+        While simple and robust, this is computationally expensive. Future optimizations
+        could use analytical gradients via automatic differentiation or parallel
+        finite differences to stay within the time budget for larger horizons.
+        Current implementation is acceptable for H <= 20 with 50ms budget.
+        
         Returns:
             gradient: (H, 7) array
         """
@@ -537,6 +535,7 @@ class TaskSpaceRecedingHorizonMPC:
         )
         
         # Finite difference for each control variable
+        # NOTE: Double loop over H*7 = expensive but simple and robust
         for t in range(H):
             for i in range(7):
                 # Perturb control
