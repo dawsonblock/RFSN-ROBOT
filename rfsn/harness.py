@@ -520,15 +520,16 @@ class RFSNHarness:
                     impedance_config.D_pos[2] = min(impedance_config.D_pos[2], 8.0)
                     
                     # Log force gate trigger
-                    self.logger.log_event(
-                        "force_gate_triggered",
-                        {
-                            "cube_table_fN": float(obs.cube_table_fN),
-                            "ee_table_fN": float(obs.ee_table_fN),
-                            "threshold": force_gate_threshold,
-                            "force_signal_is_proxy": obs.force_signal_is_proxy
-                        }
-                    )
+                    if self.logger:
+                        self.logger.log_event(
+                            "force_gate_triggered",
+                            {
+                                "cube_table_fN": float(obs.cube_table_fN),
+                                "ee_table_fN": float(obs.ee_table_fN),
+                                "threshold": force_gate_threshold,
+                                "force_signal_is_proxy": obs.force_signal_is_proxy
+                            }
+                        )
             elif decision.task_mode in ["LIFT", "TRANSPORT"]:
                 impedance_config = self.impedance_profiles.transport_stable()
             else:
