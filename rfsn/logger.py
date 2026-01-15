@@ -282,8 +282,9 @@ class RFSNLogger:
         mpc_failure_count = sum(1 for o in obs_history if o.fallback_used)
         
         # Average MPC solve time (only for steps that used MPC)
+        # Note: Include zero times (very fast solves) but exclude uninitialized (-1 or None)
         mpc_solve_times = [o.mpc_solve_time_ms for o in obs_history 
-                          if o.controller_mode == "MPC_TRACKING" and o.mpc_solve_time_ms > 0]
+                          if o.controller_mode == "MPC_TRACKING" and o.mpc_solve_time_ms >= 0]
         avg_mpc_solve_time = sum(mpc_solve_times) / len(mpc_solve_times) if mpc_solve_times else 0.0
         
         # Write to CSV
