@@ -508,6 +508,25 @@ class RFSNHarness:
                     impedance_config = self.impedance_profiles.grasp_soft()
             elif decision.task_mode == "PLACE":
                 impedance_config = self.impedance_profiles.place_gentle()
+                
+                # V10: Force gating during PLACE
+                # Reduce stiffness if contact force exceeds threshold
+                force_gate_threshold = 15.0  # Newtons
+                if obs.cube_table_fN > force_gate_threshold or obs.ee_table_fN > force_gate_threshold:
+                    # Reduce downward stiffness to prevent excessive force
+                    impedance_config.K_pos[2] = min(impedance_config.K_pos[2], 30.0)
+                    impedance_config.D_pos[2] = min(impedance_config.D_pos[2], 8.0)
+                    
+                    # Log force gate trigger
+                    self.logger.log_event(
+                        "force_gate_triggered",
+                        {
+                            "cube_table_fN": float(obs.cube_table_fN),
+                            "ee_table_fN": float(obs.ee_table_fN),
+                            "threshold": force_gate_threshold,
+                            "force_signal_is_proxy": obs.force_signal_is_proxy
+                        }
+                    )
             elif decision.task_mode in ["LIFT", "TRANSPORT"]:
                 impedance_config = self.impedance_profiles.transport_stable()
             else:
