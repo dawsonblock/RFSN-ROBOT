@@ -45,7 +45,7 @@ def test_task_space_mpc_config():
         assert config.H_max == 30
         assert config.max_iterations == 100
         assert config.time_budget_ms == 50.0
-        assert config.warm_start == True
+        assert config.warm_start
         
         print("✓ Task-space MPC config created with defaults")
         
