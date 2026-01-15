@@ -125,7 +125,7 @@ def demo_enhanced_harness():
     # Run a few steps
     print("\nRunning simulation steps...")
     for i in range(10):
-        obs = harness.step()
+        harness.step()
         
         if i % 3 == 0:
             state = harness.state_machine.current_state
