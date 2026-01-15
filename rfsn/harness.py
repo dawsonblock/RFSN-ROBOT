@@ -330,13 +330,15 @@ class RFSNHarness:
                     obs.mpc_converged = mpc_result.converged
                     obs.mpc_solve_time_ms = mpc_result.solve_time_ms
                     obs.mpc_iters = mpc_result.iters
-                    obs.mpc_cost_total = mpc_result.cost_total
-                    obs.fallback_used = False
-                else:
-                    # MPC failed, fallback to ID
                     self._handle_mpc_failure(obs, mpc_result.reason)
+                    self.mpc_solver.reset_warm_start()  # Prevent warm-starting from failed solution
                     q_ref = q_target  # Fallback to IK target
                     qd_ref = np.zeros(7)
+            except Exception as e:
+                # MPC exception, fallback to ID
+                self._handle_mpc_failure(obs, f"exception: {str(e)}")
+                self.mpc_solver.reset_warm_start()  # Prevent warm-starting from failed solution
+                q_ref = q_target
             except Exception as e:
                 # MPC exception, fallback to ID
                 self._handle_mpc_failure(obs, f"exception: {str(e)}")
