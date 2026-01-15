@@ -424,12 +424,20 @@ class TaskSpaceRecedingHorizonMPC:
         # Velocity cost (computed from joint velocities via Jacobian approximation)
         # For simplicity, penalize joint velocity magnitude scaled by velocity weights
         cost_velocity = 0.0
+        jacp = np.zeros((3, self.model.nv))
+        jacr = np.zeros((3, self.model.nv))
+
         for t in range(H):
-            # Simple approach: average the velocity cost across all joints
-            # More accurate would be J * qd to get EE velocity, but this is sufficient
-            avg_lin_vel_weight = np.mean(Q_vel[:3])
-            avg_ang_vel_weight = np.mean(Q_vel[3:6])
-            cost_velocity += (avg_lin_vel_weight + avg_ang_vel_weight) * np.sum(qd_traj[t, :]**2) / 7.0
+            # Get Jacobian at current rollout state
+            self.data_temp.qpos[:7] = q_traj[t, :]
+            mj.mj_jacBody(self.model, self.data_temp, jacp, jacr, self.ee_body_id)
+            J = np.vstack([jacp[:, :7], jacr[:, :7]])
+
+            # Compute EE velocity
+            xd_ee = J @ qd_traj[t, :]  # (6,) [linear(3), angular(3)]
+
+            # Apply task-space velocity cost
+            cost_velocity += np.sum(Q_vel * xd_ee**2)
         
         # Effort cost
         cost_effort = np.sum(R * qdd_trajectory**2)
