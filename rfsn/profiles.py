@@ -35,14 +35,34 @@ In v7, these parameters now control ACTUAL MPC behavior when controller_mode=MPC
 
 - contact_policy:   Semantic hint (not enforced in control)
 
-Profile Variant Design Intent (V7):
+V8 UPDATE: Task-Space MPC Mapping
+==================================
+In v8, when controller_mode=TASK_SPACE_MPC:
+
+- Q_diag[0:3]:      Task-space position tracking (x, y, z)
+                    Directly used as Q_pos_task
+                    
+- Q_diag[3:6]:      Task-space orientation tracking (scaled down by 0.1)
+                    Used as Q_ori_task after scaling
+                    
+- Q_diag[7:13]:     Task-space velocity penalty [lin(3), ang(3)]
+                    Used as Q_vel_task
+                    
+- R_diag, du_penalty: Same as v7, used in task-space optimization
+
+When controller_mode=IMPEDANCE (v8):
+- Q_diag maps to impedance stiffness (K_pos, K_ori)
+- Velocity terms map to damping (D_pos, D_ori)
+- Impedance profiles are state-dependent (see impedance_controller.py)
+
+Profile Variant Design Intent (V7/V8):
 - base:      Balanced horizon, moderate Q/R, moderate du
 - precise:   Longer horizon, higher Q, lower R (tight tracking)
 - smooth:    Medium horizon, moderate Q, higher R & du (gentle motion)
 - fast:      Short horizon, moderate Q, lower R & du (responsive)
 - stable:    Medium horizon, lower Q, higher R & du (conservative)
 
-State-Specific Tuning (V7):
+State-Specific Tuning (V7/V8):
 - REACH/TRANSPORT: Longer horizons (15-20), moderate R, moderate du
 - GRASP/PLACE: Shorter horizons (8-12), higher du, more velocity penalty
 - RECOVER: Short horizon (5-8), high R, conservative accel bounds
