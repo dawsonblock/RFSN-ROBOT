@@ -25,7 +25,6 @@ import time
 import mujoco as mj
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
-from scipy.spatial.transform import Rotation as R
 
 
 @dataclass
