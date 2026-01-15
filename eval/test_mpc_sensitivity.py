@@ -281,9 +281,11 @@ def test_mpc_sensitivity():
     criterion_3b = metrics_b['max_solve_time'] < 100.0
     criterion_3 = criterion_3a and criterion_3b
     criteria_met.append((f"Solve time within budget (A:{metrics_a['max_solve_time']:.1f}ms, B:{metrics_b['max_solve_time']:.1f}ms)", criterion_3))
-    
-    # 4. Low failure rate (< 10%)
-    criterion_4 = metrics_a['failure_rate'] < 0.1 and metrics_b['failure_rate'] < 0.1
+    # 5. Both configs make reasonable progress (error reduction > 25%)
+    progress_a = (metrics_a['q_errors'][0] - metrics_a['final_error']) / metrics_a['q_errors'][0]
+    progress_b = (metrics_b['q_errors'][0] - metrics_b['final_error']) / metrics_b['q_errors'][0]
+    criterion_5 = progress_a > 0.25 and progress_b > 0.25
+    criteria_met.append((f"Making progress (A reduces by {progress_a*100:.1f}%, B reduces by {progress_b*100:.1f}%)", criterion_5))
     criteria_met.append((f"Low failure rate (A:{metrics_a['failure_rate']*100:.1f}%, B:{metrics_b['failure_rate']*100:.1f}%)", criterion_4))
     
     # 5. Both configs make reasonable progress (any error reduction is good)
