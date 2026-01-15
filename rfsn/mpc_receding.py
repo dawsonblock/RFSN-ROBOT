@@ -728,9 +728,28 @@ class RecedingHorizonMPCQP:
                 eps_rel=1e-4,
                 max_iter=self.config.max_iterations,
                 time_limit=self.config.time_budget_ms / 1000.0
-            )
-            self.prev_horizon = H
-        else:
+            # Warm start if available
+            if self.config.warm_start and self.prev_solution is not None and len(self.prev_solution) == n_z:
+                # Shift previous solution for a better warm start
+                warm_start_sol = np.zeros(n_z)
+    
+                # Shift states and controls
+                for t in range(H):
+                    # old x_{t+1} -> new x_t
+                    old_idx_x_tp1 = (t + 1) * (n_states + n_controls)
+                    new_idx_x_t = t * (n_states + n_controls)
+                    warm_start_sol[new_idx_x_t : new_idx_x_t + n_states] = self.prev_solution[old_idx_x_tp1 : old_idx_x_tp1 + n_states]
+        
+                    if t < H - 1:
+                        # old u_{t+1} -> new u_t
+                        old_idx_u_tp1 = old_idx_x_tp1 + n_states
+                        new_idx_u_t = new_idx_x_t + n_states
+                        warm_start_sol[new_idx_u_t : new_idx_u_t + n_controls] = self.prev_solution[old_idx_u_tp1 : old_idx_u_tp1 + n_controls]
+
+                # Last state is a copy of the second to last
+                warm_start_sol[H * (n_states + n_controls) : ] = warm_start_sol[(H-1) * (n_states + n_controls) : (H-1) * (n_states + n_controls) + n_states]
+
+                self.solver.warm_start(x=warm_start_sol)
             # Update cost and constraint matrices when parameters change
             self.solver.update(Px=P.data, q=q_vec, l=l_full, u=u_full)
         
