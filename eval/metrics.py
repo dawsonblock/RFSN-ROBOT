@@ -140,7 +140,7 @@ def compute_metrics(episodes_df: pd.DataFrame, events: List[dict]) -> Dict:
                 v = float(v)
             except (TypeError, ValueError):
                 continue
-            if not np.isfinite(v):
+            if (v != v) or (v == float("inf")) or (v == float("-inf")):
                 continue
             gate_values.append(v)
 
