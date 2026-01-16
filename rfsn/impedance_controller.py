@@ -216,7 +216,19 @@ class ImpedanceController:
         # force signal may be proxy/low-fidelity so we do not over-trust missing
         # force data. This matches the V11 behavior and is intentionally more
         # conservative than the historical default (False).
-        is_proxy = bool(force_signals.get('force_signal_is_proxy', True))
+        raw_proxy = force_signals.get('force_signal_is_proxy', None)
+        if raw_proxy is None:
+            is_proxy = True
+        elif isinstance(raw_proxy, str):
+            v = raw_proxy.strip().lower()
+            if v in ("1", "true", "t", "yes", "y", "on"):
+                is_proxy = True
+            elif v in ("0", "false", "f", "no", "n", "off"):
+                is_proxy = False
+            else:
+                is_proxy = True
+        else:
+            is_proxy = bool(raw_proxy)
         
         # PLACE force gating: cap downward force if excessive table contact
         PLACE_FORCE_THRESHOLD = 15.0  # N
