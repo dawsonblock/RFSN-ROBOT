@@ -542,8 +542,10 @@ class RFSNHarness:
             
             obs.controller_mode = "IMPEDANCE"
             
-            # V11: Log force gate events
-            if self.impedance_controller.force_gate_triggered and self.logger:
+            # V11: Log force gate events (rising edge only)
+            gate_now = bool(self.impedance_controller.force_gate_triggered)
+            gate_prev = bool(getattr(self, "_prev_impedance_gate_triggered", False))
+            if gate_now and (not gate_prev) and self.logger:
                 self.logger.log_event(
                     "impedance_force_gate_triggered",
                     {
@@ -554,6 +556,7 @@ class RFSNHarness:
                         "state": decision.task_mode
                     }
                 )
+            self._prev_impedance_gate_triggered = gate_now
         else:
             # Compute control (inverse dynamics tracking q_ref, qd_ref)
             tau = self._inverse_dynamics_control(obs.q, obs.qd, q_ref, qd_ref, decision)
