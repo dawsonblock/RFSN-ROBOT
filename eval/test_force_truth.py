@@ -20,7 +20,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from rfsn.harness import RFSNHarness
 from rfsn.logger import RFSNLogger
-from rfsn.mujoco_utils import init_id_cache
 
 
 def test_impedance_force_routing():

@@ -343,7 +343,7 @@ def test_contact_force_feedback():
             'cube_fingers_fN': 2.0,
             'force_signal_is_proxy': False
         }
-        tau_gated = controller.compute_torques(
+        controller.compute_torques(
             data, x_target_pos, x_target_quat,
             force_signals=high_force_signals,
             state_name="PLACE"

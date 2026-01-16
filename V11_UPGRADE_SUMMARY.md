@@ -205,7 +205,7 @@ python -m eval.report runs/<run_dir>
 ### Grep for efc_force (should only show deprecation):
 ```bash
 grep -n "efc_force" rfsn/impedance_controller.py
-# 287: RuntimeError("Deprecated: efc_force contact mapping is invalid...")
+# 345: RuntimeError("Deprecated: efc_force contact mapping is invalid...")
 ```
 
 ### Grep for force_signals (should show usage):

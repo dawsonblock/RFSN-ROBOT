@@ -138,7 +138,9 @@ class ImpedanceController:
                 - 'cube_table_fN': float
                 - 'cube_fingers_fN': float
                 - 'force_signal_is_proxy': bool
-            state_name: Current state name for state-specific gating logic
+            state_name: Optional name of the current high-level state; reserved for
+                future state-specific gating logic. Currently unused and gating
+                thresholds are state-agnostic.
         
         Returns:
             tau: Joint torques (7,)
@@ -216,30 +218,23 @@ class ImpedanceController:
                     source = "cube_table"
                     force_value = cube_table_fN
                 
-                # Cap downward (negative Z) force component only
-                if F_impedance[2] < 0:  # Downward force
-                    F_impedance[2] = 0.0  # Zero out downward force
-                
+                # Use local gain values to avoid modifying config
                 # Soften Z stiffness and increase damping to prevent force buildup
-                # Note: This modifies the current config but doesn't persist
-                original_K_z = self.config.K_pos[2]
-                original_D_z = self.config.D_pos[2]
-                self.config.K_pos[2] = min(self.config.K_pos[2], 30.0)
-                self.config.D_pos[2] = max(self.config.D_pos[2], 20.0)
+                K_z_softened = min(self.config.K_pos[2], 30.0)
+                D_z_softened = max(self.config.D_pos[2], 20.0)
                 
                 # Recompute Z component with softened gains
-                F_impedance[2] = self.config.K_pos[2] * pos_error[2] + self.config.D_pos[2] * vel_error_lin[2]
-                F_impedance[2] = max(F_impedance[2], 0.0)  # Keep non-negative (no pushing down)
+                # Keep non-negative (no pushing down)
+                F_impedance[2] = max(
+                    K_z_softened * pos_error[2] + D_z_softened * vel_error_lin[2],
+                    0.0
+                )
                 
                 # Track gate trigger
                 self.force_gate_triggered = True
                 self.force_gate_value = force_value
                 self.force_gate_source = source
                 self.force_gate_proxy = is_proxy
-                
-                # Restore original gains (for next call)
-                self.config.K_pos[2] = original_K_z
-                self.config.D_pos[2] = original_D_z
             
             # GRASP force gating: soften if excessive gripper force
             GRASP_FORCE_MAX = 25.0  # N
@@ -248,7 +243,7 @@ class ImpedanceController:
                 scale_factor = GRASP_FORCE_MAX / cube_fingers_fN
                 F_impedance[:3] *= scale_factor
     
-                # Track gate trigger, but do not overwrite if already set
+                # Track gate trigger only if PLACE gate hasn't already triggered
                 if not self.force_gate_triggered:
                     self.force_gate_triggered = True
                     self.force_gate_value = cube_fingers_fN

@@ -7,7 +7,6 @@ Usage:
     python demo_impedance.py
 """
 
-import numpy as np
 import mujoco as mj
 from rfsn.harness import RFSNHarness
 from rfsn.logger import RFSNLogger
