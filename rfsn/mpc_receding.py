@@ -728,7 +728,9 @@ class RecedingHorizonMPCQP:
                 eps_rel=1e-4,
                 max_iter=self.config.max_iterations,
                 time_limit=self.config.time_budget_ms / 1000.0
-            # Warm start if available
+            )
+            
+            # Warm start if available (after setup)
             if self.config.warm_start and self.prev_solution is not None and len(self.prev_solution) == n_z:
                 # Shift previous solution for a better warm start
                 warm_start_sol = np.zeros(n_z)
@@ -750,12 +752,16 @@ class RecedingHorizonMPCQP:
                 warm_start_sol[H * (n_states + n_controls) : ] = warm_start_sol[(H-1) * (n_states + n_controls) : (H-1) * (n_states + n_controls) + n_states]
 
                 self.solver.warm_start(x=warm_start_sol)
+            
+            # Store horizon for future updates
+            self.prev_horizon = H
+        else:
             # Update cost and constraint matrices when parameters change
             self.solver.update(Px=P.data, q=q_vec, l=l_full, u=u_full)
-        
-        # Warm start if available
-        if self.prev_solution is not None and len(self.prev_solution) == n_z:
-            self.solver.warm_start(x=self.prev_solution)
+            
+            # Warm start if available
+            if self.prev_solution is not None and len(self.prev_solution) == n_z:
+                self.solver.warm_start(x=self.prev_solution)
         
         # Solve
         result = self.solver.solve()
