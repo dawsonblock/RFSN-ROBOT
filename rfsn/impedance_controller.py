@@ -248,9 +248,9 @@ class ImpedanceController:
                 # Reduce overall stiffness to prevent over-grasping
                 scale_factor = GRASP_FORCE_MAX / cube_fingers_fN
                 F_impedance[:3] *= scale_factor
-    
-                # Track gate trigger only if PLACE gate hasn't already triggered
-                if not self.force_gate_triggered:
+    # Track gate trigger (prefer the highest-severity force for reporting)
+    if (not self.force_gate_triggered) or (cube_fingers_fN > self.force_gate_value):
+        self.force_gate_triggered = True
                     self.force_gate_triggered = True
                     self.force_gate_value = cube_fingers_fN
                     self.force_gate_source = "cube_fingers"
