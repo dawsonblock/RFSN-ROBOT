@@ -212,6 +212,10 @@ class ImpedanceController:
         ee_table_fN = _safe_fN(force_signals.get('ee_table_fN', 0.0))
         cube_table_fN = _safe_fN(force_signals.get('cube_table_fN', 0.0))
         cube_fingers_fN = _safe_fN(force_signals.get('cube_fingers_fN', 0.0))
+        # Default to True when the flag is missing: conservatively assume the
+        # force signal may be proxy/low-fidelity so we do not over-trust missing
+        # force data. This matches the V11 behavior and is intentionally more
+        # conservative than the historical default (False).
         is_proxy = bool(force_signals.get('force_signal_is_proxy', True))
         
         # PLACE force gating: cap downward force if excessive table contact
