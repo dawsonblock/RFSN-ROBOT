@@ -198,12 +198,18 @@ class ImpedanceController:
             force_mask = np.abs(F_target) > 1e-3
             F_impedance = np.where(force_mask, F_target, F_impedance)
         
-        # V11: Force-aware impedance control using truthful force signals
-        if force_signals is not None:
-            ee_table_fN = force_signals.get('ee_table_fN', 0.0)
-            cube_table_fN = force_signals.get('cube_table_fN', 0.0)
-            cube_fingers_fN = force_signals.get('cube_fingers_fN', 0.0)
-            is_proxy = force_signals.get('force_signal_is_proxy', False)
+        def _safe_fN(x) -> float:
+            try:
+                x = float(x)
+            except (TypeError, ValueError):
+                return 0.0
+            return x if np.isfinite(x) else 0.0
+
+        ee_table_fN = _safe_fN(force_signals.get('ee_table_fN', 0.0))
+        cube_table_fN = _safe_fN(force_signals.get('cube_table_fN', 0.0))
+        cube_fingers_fN = _safe_fN(force_signals.get('cube_fingers_fN', 0.0))
+        is_proxy = bool(force_signals.get('force_signal_is_proxy', False))
+
             
             # PLACE force gating: cap downward force if excessive table contact
             PLACE_FORCE_THRESHOLD = 15.0  # N
