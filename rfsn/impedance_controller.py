@@ -251,6 +251,9 @@ class ImpedanceController:
     # Track gate trigger (prefer the highest-severity force for reporting)
     if (not self.force_gate_triggered) or (cube_fingers_fN > self.force_gate_value):
         self.force_gate_triggered = True
+        self.force_gate_value = cube_fingers_fN
+        self.force_gate_source = "cube_fingers"
+        self.force_gate_proxy = is_proxy
                     self.force_gate_triggered = True
                     self.force_gate_value = cube_fingers_fN
                     self.force_gate_source = "cube_fingers"
