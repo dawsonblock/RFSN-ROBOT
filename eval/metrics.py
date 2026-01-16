@@ -133,7 +133,17 @@ def compute_metrics(episodes_df: pd.DataFrame, events: List[dict]) -> Dict:
     metrics['impedance_gate_trigger_count'] = len(impedance_gate_events)
     
     if impedance_gate_events:
-        gate_values = [e.get('data', {}).get('gate_value', 0.0) for e in impedance_gate_events]
+        gate_values = []
+        for e in impedance_gate_events:
+            v = e.get('data', {}).get('gate_value', 0.0)
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not np.isfinite(v):
+                continue
+            gate_values.append(v)
+
         metrics['mean_gate_force_value'] = sum(gate_values) / len(gate_values) if gate_values else 0.0
         metrics['max_gate_force_value'] = max(gate_values) if gate_values else 0.0
         
