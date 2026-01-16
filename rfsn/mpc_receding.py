@@ -718,50 +718,49 @@ class RecedingHorizonMPCQP:
         u_full = np.concatenate([u_constraint, np.tile(self.config.qdd_max, H)])
         
         # Setup OSQP problem
-        # Create new solver or update existing one if horizon unchanged
-        if self.solver is None or self.prev_horizon != H:
-            self.solver = osqp.OSQP()
-            self.solver.setup(
-                P=P, q=q_vec, A=A_full, l=l_full, u=u_full,
-                verbose=False,
-                eps_abs=1e-4,
-                eps_rel=1e-4,
-                max_iter=self.config.max_iterations,
-                time_limit=self.config.time_budget_ms / 1000.0
-            )
-            
-            # Warm start if available (after setup)
-            if self.config.warm_start and self.prev_solution is not None and len(self.prev_solution) == n_z:
-                # Shift previous solution for a better warm start
+        # Always create new solver since P matrix structure can change with du_penalty
+        self.solver = osqp.OSQP()
+        self.solver.setup(
+            P=P, q=q_vec, A=A_full, l=l_full, u=u_full,
+            verbose=False,
+            eps_abs=1e-4,
+            eps_rel=1e-4,
+            max_iter=self.config.max_iterations,
+            time_limit=self.config.time_budget_ms / 1000.0
+        )
+        
+        # Warm start if available (after setup)
+        if self.config.warm_start and self.prev_solution is not None and len(self.prev_solution) == n_z:
+            # Shift previous solution for a better warm start when horizon matches
+            if self.prev_horizon == H:
+                # Same horizon: shift solution
                 warm_start_sol = np.zeros(n_z)
-    
+
                 # Shift states and controls
                 for t in range(H):
-                    # old x_{t+1} -> new x_t
-                    old_idx_x_tp1 = (t + 1) * (n_states + n_controls)
-                    new_idx_x_t = t * (n_states + n_controls)
-                    warm_start_sol[new_idx_x_t : new_idx_x_t + n_states] = self.prev_solution[old_idx_x_tp1 : old_idx_x_tp1 + n_states]
-        
-                    if t < H - 1:
-                        # old u_{t+1} -> new u_t
-                        old_idx_u_tp1 = old_idx_x_tp1 + n_states
-                        new_idx_u_t = new_idx_x_t + n_states
-                        warm_start_sol[new_idx_u_t : new_idx_u_t + n_controls] = self.prev_solution[old_idx_u_tp1 : old_idx_u_tp1 + n_controls]
+                    if t + 1 < len(self.prev_solution) // (n_states + n_controls):
+                        # old x_{t+1} -> new x_t
+                        old_idx_x_tp1 = (t + 1) * (n_states + n_controls)
+                        new_idx_x_t = t * (n_states + n_controls)
+                        warm_start_sol[new_idx_x_t : new_idx_x_t + n_states] = self.prev_solution[old_idx_x_tp1 : old_idx_x_tp1 + n_states]
+            
+                        if t < H - 1:
+                            # old u_{t+1} -> new u_t
+                            old_idx_u_tp1 = old_idx_x_tp1 + n_states
+                            new_idx_u_t = new_idx_x_t + n_states
+                            warm_start_sol[new_idx_u_t : new_idx_u_t + n_controls] = self.prev_solution[old_idx_u_tp1 : old_idx_u_tp1 + n_controls]
 
                 # Last state is a copy of the second to last
-                warm_start_sol[H * (n_states + n_controls) : ] = warm_start_sol[(H-1) * (n_states + n_controls) : (H-1) * (n_states + n_controls) + n_states]
+                if H > 0:
+                    warm_start_sol[H * (n_states + n_controls) : ] = warm_start_sol[(H-1) * (n_states + n_controls) : (H-1) * (n_states + n_controls) + n_states]
 
                 self.solver.warm_start(x=warm_start_sol)
-            
-            # Store horizon for future updates
-            self.prev_horizon = H
-        else:
-            # Update cost and constraint matrices when parameters change
-            self.solver.update(Px=P.data, q=q_vec, l=l_full, u=u_full)
-            
-            # Warm start if available
-            if self.prev_solution is not None and len(self.prev_solution) == n_z:
+            else:
+                # Different horizon: use previous solution as-is if compatible
                 self.solver.warm_start(x=self.prev_solution)
+        
+        # Store horizon for future warm starts
+        self.prev_horizon = H
         
         # Solve
         result = self.solver.solve()
