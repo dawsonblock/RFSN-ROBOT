@@ -35,6 +35,12 @@ def compute_metrics(episodes_df: pd.DataFrame, events: List[dict]) -> Dict:
     - Penalties for collisions, penetration, repeated RECOVER
     - Separate tracking for different failure modes
     
+    V11 Force Truth Metrics:
+    - Proxy rate: % steps with force_signal_is_proxy=True
+    - Impedance gate trigger count
+    - Mean/max gated force value
+    - Episodes with 100% proxy rate
+    
     Returns:
         Dictionary of metrics
     """
@@ -122,6 +128,42 @@ def compute_metrics(episodes_df: pd.DataFrame, events: List[dict]) -> Dict:
         event_counts[event_type] = event_counts.get(event_type, 0) + 1
     metrics['event_counts'] = event_counts
     
+    # V11: Force truth metrics from events
+    impedance_gate_events = [e for e in events if e['event_type'] == 'impedance_force_gate_triggered']
+    metrics['impedance_gate_trigger_count'] = len(impedance_gate_events)
+    
+    if impedance_gate_events:
+        gate_values = []
+        for e in impedance_gate_events:
+            v = e.get('data', {}).get('gate_value', 0.0)
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            if (v != v) or (v == float("inf")) or (v == float("-inf")):
+                continue
+            gate_values.append(v)
+
+        metrics['mean_gate_force_value'] = sum(gate_values) / len(gate_values) if gate_values else 0.0
+        metrics['max_gate_force_value'] = max(gate_values) if gate_values else 0.0
+        
+        # Count by source
+        gate_sources = {}
+        gate_proxy_count = 0
+        for e in impedance_gate_events:
+            source = e.get('data', {}).get('gate_source', 'unknown')
+            gate_sources[source] = gate_sources.get(source, 0) + 1
+            if e.get('data', {}).get('gate_proxy', False):
+                gate_proxy_count += 1
+        
+        metrics['gate_sources'] = gate_sources
+        metrics['gate_proxy_count'] = gate_proxy_count
+    else:
+        metrics['mean_gate_force_value'] = 0.0
+        metrics['max_gate_force_value'] = 0.0
+        metrics['gate_sources'] = {}
+        metrics['gate_proxy_count'] = 0
+    
     return metrics
 
 
@@ -169,6 +211,20 @@ def format_metrics(metrics: Dict) -> str:
         lines.append(f"  False lift rate:           {metrics['false_lift_rate']:.1%}")
         lines.append(f"  Mean confirmation time:    {metrics['mean_grasp_confirmation_time_s']:.2f} s")
         lines.append(f"  Total slip events:         {metrics['total_slip_events']}")
+        lines.append("")
+    
+    # V11: Force truth metrics
+    if 'impedance_gate_trigger_count' in metrics:
+        lines.append("FORCE TRUTH METRICS (V11):")
+        lines.append(f"  Impedance gate triggers:   {metrics['impedance_gate_trigger_count']}")
+        if metrics['impedance_gate_trigger_count'] > 0:
+            lines.append(f"  Mean gated force:          {metrics['mean_gate_force_value']:.2f} N")
+            lines.append(f"  Max gated force:           {metrics['max_gate_force_value']:.2f} N")
+            lines.append(f"  Gate triggers from proxy:  {metrics['gate_proxy_count']}")
+            if metrics.get('gate_sources'):
+                lines.append(f"  Gate sources:")
+                for source, count in metrics['gate_sources'].items():
+                    lines.append(f"    {source}: {count}")
         lines.append("")
     
     if metrics.get('failure_reasons'):
