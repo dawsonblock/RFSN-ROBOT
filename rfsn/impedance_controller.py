@@ -214,8 +214,9 @@ class ImpedanceController:
             # PLACE force gating: cap downward force if excessive table contact
             PLACE_FORCE_THRESHOLD = 15.0  # N
             max_table_force = max(ee_table_fN, cube_table_fN)
-            
-            if max_table_force > PLACE_FORCE_THRESHOLD:
+
+            place_gate_enabled = (state_name is None) or (state_name == "PLACE")
+            if place_gate_enabled and (max_table_force > PLACE_FORCE_THRESHOLD):
                 # Determine source for logging
                 if ee_table_fN > cube_table_fN:
                     source = "ee_table"
@@ -223,28 +224,29 @@ class ImpedanceController:
                 else:
                     source = "cube_table"
                     force_value = cube_table_fN
-                
+
                 # Use local gain values to avoid modifying config
                 # Soften Z stiffness and increase damping to prevent force buildup
                 K_z_softened = min(self.config.K_pos[2], 30.0)
                 D_z_softened = max(self.config.D_pos[2], 20.0)
-                
+
                 # Recompute Z component with softened gains
                 # Keep non-negative (no pushing down)
                 F_impedance[2] = max(
                     K_z_softened * pos_error[2] + D_z_softened * vel_error_lin[2],
                     0.0
                 )
-                
+
                 # Track gate trigger
                 self.force_gate_triggered = True
                 self.force_gate_value = force_value
                 self.force_gate_source = source
                 self.force_gate_proxy = is_proxy
-            
+
             # GRASP force gating: soften if excessive gripper force
             GRASP_FORCE_MAX = 25.0  # N
-            if cube_fingers_fN > GRASP_FORCE_MAX:
+            grasp_gate_enabled = (state_name is None) or (state_name == "GRASP")
+            if grasp_gate_enabled and (cube_fingers_fN > GRASP_FORCE_MAX):
                 # Reduce overall stiffness to prevent over-grasping
                 scale_factor = GRASP_FORCE_MAX / cube_fingers_fN
                 F_impedance[:3] *= scale_factor
