@@ -509,26 +509,6 @@ class RFSNHarness:
                     impedance_config = self.impedance_profiles.grasp_soft()
             elif decision.task_mode == "PLACE":
                 impedance_config = self.impedance_profiles.place_gentle()
-                
-                # V10: Force gating during PLACE
-                # Reduce stiffness if contact force exceeds threshold
-                force_gate_threshold = GraspValidationConfig.FORCE_GATE_THRESHOLD
-                if obs.cube_table_fN > force_gate_threshold or obs.ee_table_fN > force_gate_threshold:
-                    # Reduce downward stiffness to prevent excessive force
-                    impedance_config.K_pos[2] = min(impedance_config.K_pos[2], 30.0)
-                    impedance_config.D_pos[2] = min(impedance_config.D_pos[2], 8.0)
-                    
-                    # Log force gate trigger
-                    if self.logger:
-                        self.logger.log_event(
-                            "force_gate_triggered",
-                            {
-                                "cube_table_fN": float(obs.cube_table_fN),
-                                "ee_table_fN": float(obs.ee_table_fN),
-                                "threshold": force_gate_threshold,
-                                "force_signal_is_proxy": obs.force_signal_is_proxy
-                            }
-                        )
             elif decision.task_mode in ["LIFT", "TRANSPORT"]:
                 impedance_config = self.impedance_profiles.transport_stable()
             else:
@@ -538,8 +518,13 @@ class RFSNHarness:
             # Update controller config
             self.impedance_controller.update_config(impedance_config)
 
-            # V8 Fix: Enable contact force feedback for PLACE to cap normal force
-            use_contact_feedback = (decision.task_mode == "PLACE")
+            # V11: Prepare force signals bundle for impedance controller
+            force_signals = {
+                'ee_table_fN': obs.ee_table_fN,
+                'cube_table_fN': obs.cube_table_fN,
+                'cube_fingers_fN': obs.cube_fingers_fN,
+                'force_signal_is_proxy': obs.force_signal_is_proxy
+            }
 
             # Compute impedance control torques directly
             tau = self.impedance_controller.compute_torques(
@@ -547,7 +532,8 @@ class RFSNHarness:
                 decision.x_target_pos,
                 decision.x_target_quat,
                 nullspace_target_q=q_target,  # Use IK solution for null-space
-                contact_force_feedback=use_contact_feedback
+                force_signals=force_signals,
+                state_name=decision.task_mode
             )
 
             # Preserve profile-driven torque scaling safety behavior
@@ -555,6 +541,19 @@ class RFSNHarness:
                 tau = np.clip(tau * float(decision.max_tau_scale), -87.0, 87.0)
             
             obs.controller_mode = "IMPEDANCE"
+            
+            # V11: Log force gate events
+            if self.impedance_controller.force_gate_triggered and self.logger:
+                self.logger.log_event(
+                    "impedance_force_gate_triggered",
+                    {
+                        "t": float(self.t),
+                        "gate_value": float(self.impedance_controller.force_gate_value),
+                        "gate_source": self.impedance_controller.force_gate_source,
+                        "gate_proxy": self.impedance_controller.force_gate_proxy,
+                        "state": decision.task_mode
+                    }
+                )
         else:
             # Compute control (inverse dynamics tracking q_ref, qd_ref)
             tau = self._inverse_dynamics_control(obs.q, obs.qd, q_ref, qd_ref, decision)

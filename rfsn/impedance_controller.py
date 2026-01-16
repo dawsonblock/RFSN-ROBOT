@@ -102,6 +102,12 @@ class ImpedanceController:
         # Temp data for computations
         self.data_temp = mj.MjData(model)
         
+        # V11: Force gate tracking
+        self.force_gate_triggered = False
+        self.force_gate_value = 0.0
+        self.force_gate_source = None
+        self.force_gate_proxy = False
+        
     def compute_torques(
         self,
         data: mj.MjData,
@@ -111,7 +117,9 @@ class ImpedanceController:
         xd_target_ang: Optional[np.ndarray] = None,
         F_target: Optional[np.ndarray] = None,
         nullspace_target_q: Optional[np.ndarray] = None,
-        contact_force_feedback: bool = False
+        contact_force_feedback: bool = False,
+        force_signals: Optional[dict] = None,
+        state_name: Optional[str] = None
     ) -> np.ndarray:
         """
         Compute joint torques for impedance control.
@@ -124,7 +132,13 @@ class ImpedanceController:
             xd_target_ang: Target angular velocity (3,), defaults to zero
             F_target: Target contact force (6,) [force(3), torque(3)], optional
             nullspace_target_q: Target joint configuration for null-space control (7,)
-            contact_force_feedback: If True, read and use actual contact forces from MuJoCo
+            contact_force_feedback: DEPRECATED - kept for compatibility but ignored
+            force_signals: V11 force truth bundle with keys:
+                - 'ee_table_fN': float
+                - 'cube_table_fN': float
+                - 'cube_fingers_fN': float
+                - 'force_signal_is_proxy': bool
+            state_name: Current state name for state-specific gating logic
         
         Returns:
             tau: Joint torques (7,)
@@ -138,10 +152,11 @@ class ImpedanceController:
         x_ee_pos = data.xpos[self.ee_body_id].copy()
         x_ee_quat = data.xquat[self.ee_body_id].copy()
         
-        # V8 Fix: Read actual contact forces if requested
-        actual_contact_force = None
-        if contact_force_feedback:
-            actual_contact_force = self._get_ee_contact_forces(data)
+        # V11: Initialize force gate tracking
+        self.force_gate_triggered = False
+        self.force_gate_value = 0.0
+        self.force_gate_source = None
+        self.force_gate_proxy = False
         
         # Compute Jacobians
         jacp = np.zeros((3, self.model.nv))
@@ -181,18 +196,63 @@ class ImpedanceController:
             force_mask = np.abs(F_target) > 1e-3
             F_impedance = np.where(force_mask, F_target, F_impedance)
         
-        # V8 Fix: Use actual contact force feedback to cap commanded force
-        # This prevents excessive force during PLACE or contact-rich manipulation
-        if actual_contact_force is not None and np.linalg.norm(actual_contact_force[:3]) > 1.0:
-            # If we're in contact, reduce commanded force based on actual contact
-            # This implements basic hybrid force control
-            contact_force_magnitude = np.linalg.norm(actual_contact_force[:3])
+        # V11: Force-aware impedance control using truthful force signals
+        if force_signals is not None:
+            ee_table_fN = force_signals.get('ee_table_fN', 0.0)
+            cube_table_fN = force_signals.get('cube_table_fN', 0.0)
+            cube_fingers_fN = force_signals.get('cube_fingers_fN', 0.0)
+            is_proxy = force_signals.get('force_signal_is_proxy', False)
             
-            # Cap the commanded force in Z direction (most critical for PLACE)
-            if contact_force_magnitude > self.config.max_force * 0.5:
-                # Reduce Z-axis force if we're pushing too hard
-                scale_factor = (self.config.max_force * 0.5) / contact_force_magnitude
-                F_impedance[2] = F_impedance[2] * scale_factor
+            # PLACE force gating: cap downward force if excessive table contact
+            PLACE_FORCE_THRESHOLD = 15.0  # N
+            max_table_force = max(ee_table_fN, cube_table_fN)
+            
+            if max_table_force > PLACE_FORCE_THRESHOLD:
+                # Determine source for logging
+                if ee_table_fN > cube_table_fN:
+                    source = "ee_table"
+                    force_value = ee_table_fN
+                else:
+                    source = "cube_table"
+                    force_value = cube_table_fN
+                
+                # Cap downward (negative Z) force component only
+                if F_impedance[2] < 0:  # Downward force
+                    F_impedance[2] = 0.0  # Zero out downward force
+                
+                # Soften Z stiffness and increase damping to prevent force buildup
+                # Note: This modifies the current config but doesn't persist
+                original_K_z = self.config.K_pos[2]
+                original_D_z = self.config.D_pos[2]
+                self.config.K_pos[2] = min(self.config.K_pos[2], 30.0)
+                self.config.D_pos[2] = max(self.config.D_pos[2], 20.0)
+                
+                # Recompute Z component with softened gains
+                F_impedance[2] = self.config.K_pos[2] * pos_error[2] + self.config.D_pos[2] * vel_error_lin[2]
+                F_impedance[2] = max(F_impedance[2], 0.0)  # Keep non-negative (no pushing down)
+                
+                # Track gate trigger
+                self.force_gate_triggered = True
+                self.force_gate_value = force_value
+                self.force_gate_source = source
+                self.force_gate_proxy = is_proxy
+                
+                # Restore original gains (for next call)
+                self.config.K_pos[2] = original_K_z
+                self.config.D_pos[2] = original_D_z
+            
+            # GRASP force gating: soften if excessive gripper force
+            GRASP_FORCE_MAX = 25.0  # N
+            if cube_fingers_fN > GRASP_FORCE_MAX:
+                # Reduce overall stiffness to prevent over-grasping
+                scale_factor = GRASP_FORCE_MAX / cube_fingers_fN
+                F_impedance[:3] *= scale_factor
+                
+                # Track gate trigger
+                self.force_gate_triggered = True
+                self.force_gate_value = cube_fingers_fN
+                self.force_gate_source = "cube_fingers"
+                self.force_gate_proxy = is_proxy
         
         # Clamp Cartesian forces
         F_impedance[:3] = np.clip(F_impedance[:3], -self.config.max_force, self.config.max_force)
@@ -277,74 +337,18 @@ class ImpedanceController:
     
     def _get_ee_contact_forces(self, data: mj.MjData) -> Optional[np.ndarray]:
         """
-        Read actual contact forces on end-effector from MuJoCo contact solver.
+        DEPRECATED V11: This method used invalid efc_force contact mapping.
         
-        V8 Fix: Provides contact force feedback for hybrid force control.
-        Enables impedance controller to cap commanded forces based on actual contact.
+        Use force_signals parameter in compute_torques() instead, which receives
+        truthful force signals from mujoco_utils.compute_contact_wrenches().
         
-        Args:
-            data: Current MuJoCo data
-        
-        Returns:
-            contact_wrench: (6,) [force(3), torque(3)] in world frame, or None if no contact
+        Raises:
+            RuntimeError: Always raises to prevent invalid usage
         """
-        # Accumulate contact forces on EE body
-        total_force = np.zeros(3)
-        total_torque = np.zeros(3)
-        
-        has_contact = False
-        
-        # Iterate through all contacts
-        for i in range(data.ncon):
-            contact = data.contact[i]
-            
-            # Check if this contact involves the EE body
-            geom1 = contact.geom1
-            geom2 = contact.geom2
-            
-            body1 = self.model.geom_bodyid[geom1]
-            body2 = self.model.geom_bodyid[geom2]
-            
-            if body1 == self.ee_body_id or body2 == self.ee_body_id:
-                # This contact involves EE - read constraint force
-                # MuJoCo contact constraints: For standard friction pyramid,
-                # each contact typically has up to 4 constraint forces:
-                # 1 normal + friction cone (can be 1-3 tangential components)
-                # 
-                # For contacts in efc_force array, we need to find the corresponding
-                # constraint index. This is a simplified approximation that works
-                # for typical manipulation scenarios.
-                
-                # Get contact frame (normal and tangent)
-                contact_frame = contact.frame.reshape(3, 3)  # 3x3 rotation matrix
-                contact_normal = contact_frame[:, 0]  # First column is normal
-                
-                # Approximate force from contact normal force (stored in constraint solver)
-                # This is a simplified implementation - full implementation would
-                # properly map contact -> constraint indices via efc_J
-                if i < len(data.efc_force) // 3:
-                    # Normal force (dominant component for manipulation)
-                    fn = data.efc_force[i] if i < len(data.efc_force) else 0.0
-                    
-                    # Simple reconstruction: mainly normal force
-                    # (tangential forces often small compared to normal in manipulation)
-                    force = fn * contact_normal
-                    
-                    total_force += force
-                    
-                    # Compute torque: r x F
-                    contact_pos = contact.pos
-                    ee_pos = data.xpos[self.ee_body_id]
-                    r = contact_pos - ee_pos
-                    torque = np.cross(r, force)
-                    total_torque += torque
-                    
-                    has_contact = True
-        
-        if has_contact:
-            return np.concatenate([total_force, total_torque])
-        else:
-            return None
+        raise RuntimeError(
+            "Deprecated: efc_force contact mapping is invalid. "
+            "Use force_signals parameter in compute_torques() instead."
+        )
     
     def update_config(self, config: ImpedanceConfig):
         """Update impedance parameters (for state-dependent control)."""
