@@ -247,12 +247,13 @@ class ImpedanceController:
                 # Reduce overall stiffness to prevent over-grasping
                 scale_factor = GRASP_FORCE_MAX / cube_fingers_fN
                 F_impedance[:3] *= scale_factor
-                
-                # Track gate trigger
-                self.force_gate_triggered = True
-                self.force_gate_value = cube_fingers_fN
-                self.force_gate_source = "cube_fingers"
-                self.force_gate_proxy = is_proxy
+    
+                # Track gate trigger, but do not overwrite if already set
+                if not self.force_gate_triggered:
+                    self.force_gate_triggered = True
+                    self.force_gate_value = cube_fingers_fN
+                    self.force_gate_source = "cube_fingers"
+                    self.force_gate_proxy = is_proxy
         
         # Clamp Cartesian forces
         F_impedance[:3] = np.clip(F_impedance[:3], -self.config.max_force, self.config.max_force)
