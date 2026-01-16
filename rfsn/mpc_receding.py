@@ -718,7 +718,9 @@ class RecedingHorizonMPCQP:
         u_full = np.concatenate([u_constraint, np.tile(self.config.qdd_max, H)])
         
         # Setup OSQP problem
-        # Always create new solver since P matrix structure can change with du_penalty
+        # Always create a new solver; the P matrix sparsity pattern only changes
+        # when du_penalty transitions between zero and non-zero, but recreating
+        # the solver is simpler and conservatively handles all cases.
         self.solver = osqp.OSQP()
         self.solver.setup(
             P=P, q=q_vec, A=A_full, l=l_full, u=u_full,
